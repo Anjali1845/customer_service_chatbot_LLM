@@ -1,0 +1,11 @@
+streamlit==1.49.1
+
+langchain==0.3.27
+langchain-community==0.3.29
+langchain-google-genai==2.1.12
+
+faiss-cpu==1.12.0
+python-dotenv==1.1.1
+pandas==2.3.2
+pypdf==6.0.0
+Pillow==11.3.0

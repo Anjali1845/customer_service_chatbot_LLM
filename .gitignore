@@ -1,0 +1,4 @@
+.venv/
+.env
+faiss_index/
+.env
