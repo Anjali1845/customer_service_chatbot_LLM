@@ -10,6 +10,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
 
+from prompt_templates import build_prompt_template
+
 # -----------------------------
 # Load Environment Variables
 # -----------------------------
@@ -63,7 +65,21 @@ def create_vector_db():
 # -----------------------------
 # Retrieval QA Chain
 # -----------------------------
-def get_qa_chain():
+def get_qa_chain(tone_instruction: str = ""):
+    """
+    The retrieval QA chain.
+
+    ``tone_instruction`` is an optional, purely stylistic block built by
+    ``task7_sentiment.build_tone_instruction`` from the customer's
+    detected sentiment. It is inserted into the prompt verbatim and
+    only when it is non-empty, so calling ``get_qa_chain()`` with no
+    argument reproduces the previous prompt byte for byte -- the
+    answers, and therefore the knowledge-base grounding, are unchanged.
+
+    The block itself is written to adjust wording and empathy only and
+    to forbid changing any policy, so a frustrated customer gets a
+    warmer sentence, never a different eligibility rule.
+    """
 
     db = FAISS.load_local(
         str(DB_PATH),
@@ -75,21 +91,7 @@ def get_qa_chain():
         search_kwargs={"k": 3}
     )
 
-    prompt_template = """
-You are an AI Customer Support Assistant.
-
-Answer ONLY using the provided context.
-
-If the answer is not available in the context, reply exactly:
-
-"I don't know based on the knowledge base."
-
-Context:
-{context}
-
-Question:
-{question}
-"""
+    prompt_template = build_prompt_template(tone_instruction)
 
     prompt = PromptTemplate(
         template=prompt_template,
