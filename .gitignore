@@ -1,4 +1,29 @@
 .venv/
 .env
 faiss_index/
-.env
+
+# Python bytecode. Compiled per interpreter version, so committing it
+# means a machine-specific binary diff on every run -- and this project
+# is exercised under 3.10, 3.12, 3.13 and 3.14.
+__pycache__/
+*.pyc
+
+# Conversation-side support store: tickets, escalations, routing
+# decisions. Written at runtime by the app, and it holds customer
+# conversation payloads, so it never belongs in the repository.
+support.db
+
+# Local SQLite backups of the above.
+support.db-journal
+
+# Knowledge-pipeline metadata database, written at runtime.
+metadata.db
+metadata.db-journal
+
+# Hand-made backups that predate the git history. Kept on disk for
+# reference, but the history itself is the record.
+*.task6_backup
+*_backup.py
+
+# macOS
+.DS_Store
