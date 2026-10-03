@@ -1,0 +1,38 @@
+[
+  {
+    "document_id": "KB-002",
+    "filename": "internal_security_policy.txt",
+    "title": "Internal Security Policy",
+    "document_version": "1.0",
+    "product": "All Products",
+    "region": "GLOBAL",
+    "access_level": "restricted",
+    "effective_date": "2026-01-01",
+    "expiry_date": null,
+    "status": "active"
+  },
+  {
+    "document_id": "KB-003",
+    "filename": "refund_policy_v1.txt",
+    "title": "Refund Policy",
+    "document_version": "1.0",
+    "product": "All Products",
+    "region": "GLOBAL",
+    "access_level": "public",
+    "effective_date": "2026-01-01",
+    "expiry_date": "2026-05-31",
+    "status": "active"
+  },
+  {
+    "document_id": "KB-004",
+    "filename": "refund_policy_v2.txt",
+    "title": "Refund Policy",
+    "document_version": "2.0",
+    "product": "All Products",
+    "region": "GLOBAL",
+    "access_level": "public",
+    "effective_date": "2026-06-01",
+    "expiry_date": null,
+    "status": "active"
+  }
+]

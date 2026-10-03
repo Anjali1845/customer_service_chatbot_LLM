@@ -1,0 +1,5 @@
+INTERNAL SECURITY POLICY
+
+Internal users may access confidential account-security procedures.
+
+This information is restricted to authorized internal personnel.
