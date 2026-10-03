@@ -9,3 +9,16 @@ python-dotenv==1.1.1
 pandas==2.3.2
 pypdf==6.0.0
 Pillow==11.3.0
+
+# Task 5 multimodal OCR. Both are imported directly by
+# knowledge_base/multimodal/ocr_extractor.py and were missing here, so
+# the OCR path failed with a bare ModuleNotFoundError on a fresh
+# install. Floors rather than exact pins because neither could be
+# verified against this environment at the time of writing.
+#
+# pytesseract is only a wrapper: the OCR engine itself is the system
+# `tesseract` binary (apt-get install tesseract-ocr / brew install
+# tesseract), which pip cannot install. Without it pytesseract imports
+# fine and then fails at the first image_to_string call.
+pymupdf>=1.24.0
+pytesseract>=0.3.10

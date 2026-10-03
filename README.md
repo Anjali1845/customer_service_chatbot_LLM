@@ -51,6 +51,21 @@ streamlit run main.py
 
 - Now you are ready to ask questions. Type your question in Question box and hit Enter
 
+## Production Knowledge Pipeline
+
+This module automatically manages and monitors the chatbot knowledge base.
+
+### Features
+- SQLite metadata database
+- Document version management
+- Duplicate document detection using SHA-256 hashing
+- Quality validation before activation
+- Automatic rollback to previous versions
+- Pipeline monitoring with latency, confidence and escalation logs
+
+### Folder
+knowledge_pipeline/
+
 ## Sample Questions
   - Do you guys provide internship and also do you offer EMI payments?
   - Do you have javascript course?

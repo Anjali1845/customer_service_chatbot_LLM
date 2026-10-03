@@ -3,8 +3,19 @@ import sqlite3
 DB = "metadata.db"
 
 
-def get_next_version(filename):
-    conn = sqlite3.connect(DB)
+def get_next_version(filename, db_path=None):
+    """
+    The next version number for a filename.
+
+    ``db_path`` is optional and defaults to the historical relative
+    ``"metadata.db"``, so every existing caller keeps its behaviour.
+    It exists because a relative path resolves against the current
+    working directory: a caller running from a different directory --
+    the scheduler, for instance -- would otherwise read and write a
+    second, empty database and never find the real one.
+    """
+
+    conn = sqlite3.connect(db_path or DB)
     cur = conn.cursor()
 
     cur.execute(
@@ -18,10 +29,10 @@ def get_next_version(filename):
     return 1 if result is None else result + 1
 
 
-def save_version(filename, file_hash):
-    version = get_next_version(filename)
+def save_version(filename, file_hash, db_path=None):
+    version = get_next_version(filename, db_path)
 
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(db_path or DB)
     cur = conn.cursor()
 
     # Deactivate previous version
