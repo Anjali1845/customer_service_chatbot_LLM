@@ -1577,6 +1577,11 @@ def create_ticket(
     When ``existing`` is supplied, the new ticket is matched against
     it and linked as a duplicate or a related ticket. Duplicates
     inherit the original's deadlines and get no clock of their own.
+
+    ``sentiment`` is the sentiment of *this issue's own words*, not of
+    the whole conversation. That distinction matters: a risk topic
+    raised earlier in the conversation -- or by another half of a
+    multi-issue message -- must not categorise an unrelated problem.
     """
 
     policy = policy or TicketPolicy()
@@ -1668,6 +1673,161 @@ def create_ticket(
     )
 
     return ticket
+
+
+# ============================================================
+# TICKET LIFECYCLE -- CONTINUING AND COMPLETING
+# ============================================================
+
+def introduces_new_issue(
+    message: str,
+    ticket: Ticket,
+    policy: Optional[TicketPolicy] = None,
+) -> bool:
+    """
+    Does this message describe a *different* problem from the open
+    ticket it arrived alongside?
+
+    This is what stops every follow-up in a conversation becoming a
+    fresh ticket. A message continues the open ticket when it names no
+    new category, when it names the same category, or when it is about
+    the same order -- an angry "still waiting" is the same problem
+    again, not a second one. It only counts as new when it is
+    recognisably about something else, so a genuine second problem in
+    the same conversation still gets its own ticket.
+    """
+
+    policy = policy or TicketPolicy()
+
+    fields = extract_ticket_fields(message)
+
+    category = infer_category(message, fields, ())
+
+    if category == "general":
+
+        return False
+
+    if category == ticket.category:
+
+        return False
+
+    incoming_order = (fields.get("order_id") or "").upper()
+
+    if incoming_order and incoming_order == (
+        ticket.order_id or ""
+    ).upper():
+
+        return False
+
+    return True
+
+
+def is_followup_without_issue(message: str) -> bool:
+    """
+    A message that carries no issue of its own -- a nudge, a thank
+    you, a request for an update.
+
+    It continues whatever is already open rather than opening anything
+    new. A message that *does* name a problem is deliberately not this:
+    a restated fault is left to the duplicate path, which files it as
+    a duplicate on the review queue instead of quietly absorbing it.
+    """
+
+    fields = extract_ticket_fields(message)
+
+    return infer_category(message, fields, ()) == "general"
+
+
+def complete_ticket(
+    ticket: Ticket,
+    message: str,
+    sentiment: Optional[SentimentResult] = None,
+    policy: Optional[TicketPolicy] = None,
+    sla_policy: Optional[SlaPolicy] = None,
+    now: Optional[datetime] = None,
+    conversation_summary: str = "",
+) -> Tuple[Ticket, List[str]]:
+    """
+    Fold a follow-up reply into a ticket that is still waiting for
+    information, rather than raising a second ticket for the same
+    problem.
+
+    Only fields the ticket is *missing* are written, so a reply can
+    never silently overwrite an order id the customer already gave.
+    Returns the ticket and the names of the fields this message
+    completed, which is what lets the caller tell "the customer
+    answered" from "the customer said something else".
+
+    The clock is deliberately not reset: ``created_at`` is untouched,
+    so completing a ticket at minute 20 still measures from the
+    original report and the SLA conditions see the real waiting time.
+    """
+
+    policy = policy or TicketPolicy()
+
+    sla_policy = sla_policy or SlaPolicy()
+
+    moment = as_utc(now)
+
+    fields = extract_ticket_fields(message)
+
+    filled: List[str] = []
+
+    for name in (
+        "customer_name",
+        "contact",
+        "account_identifier",
+        "order_id",
+        "product_name",
+        "product_code",
+        "amount",
+        "error_code",
+        "reference_date",
+    ):
+
+        value = fields.get(name)
+
+        if value and not getattr(ticket, name, None):
+
+            setattr(ticket, name, value)
+
+            filled.append(name)
+
+    # The reply is part of the same problem, so it can also sharpen a
+    # category that was only ever guessed at.
+    if ticket.category == "general" and fields:
+
+        ticket.category = infer_category(
+            message, fields, ticket.risk_topics
+        )
+
+    ticket.missing_fields = missing_mandatory_fields(ticket, policy)
+
+    if not ticket.missing_fields and ticket.status == "awaiting_info":
+
+        ticket.status = "open"
+
+    if conversation_summary:
+
+        ticket.conversation_summary = conversation_summary
+
+    ticket.updated_at = moment
+
+    score, priority, components = score_priority(
+        ticket, policy, sla_policy, moment
+    )
+
+    ticket.priority_score = score
+    ticket.priority = priority
+    ticket.priority_components = components
+
+    apply_sla(ticket, sla_policy, moment)
+
+    ticket.masked_handoff = build_handoff_summary(
+        ticket, sla_policy, moment
+    )
+
+    return ticket, filled
 
 
 # ============================================================

@@ -13,6 +13,7 @@ Covers:
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from business_calendar import BusinessCalendarConfig, add_business_minutes
 from task6_multilingual import ConversationMessage, ConversationSession
@@ -130,6 +131,7 @@ class FakeTicket:
     breached: bool = False
     warning_due: bool = False
     warn_fraction: float = 0.75
+    created_at: Optional[datetime] = None
 
 
 print("=" * 75)
@@ -880,6 +882,122 @@ check(
         BusinessCalendarConfig(timezone_name="UTC"),
     )
     == utc(2026, 10, 2, 11, 0),
+)
+
+
+# ============================================================
+# 6. ESC-07 ON A NEUTRAL FOLLOW-UP (REGRESSION)
+#
+# The condition used to fire only when the CURRENT message was
+# classed negative, so a complaint open for twenty minutes followed
+# by a neutral "any update?" never escalated. The gate is now the
+# age of the open complaint plus the negativity of the conversation
+# history, with an open ticket's created_at anchoring the clock.
+# ============================================================
+
+print("\n[6] ESC-07 NEUTRAL FOLLOW-UP")
+
+waiting = session_with(
+    ["My order is late and this is bad.", "Any update on this?"]
+)
+
+neutral_followup = sentiment_of("Any update on this?")
+
+check(
+    "the follow-up message on its own is neutral",
+    neutral_followup.label == "neutral"
+    and neutral_followup.polarity == 0.0,
+    f"got {neutral_followup.label} pol={neutral_followup.polarity}",
+)
+
+complained_at = waiting.messages[0].timestamp
+
+aged = engine_for().evaluate(
+    "sess-07-neutral",
+    "Any update on this?",
+    neutral_followup,
+    waiting,
+    complained_at + timedelta(minutes=21),
+)
+
+check(
+    "a neutral follow-up on an aged complaint escalates",
+    "ESC-07" in aged.condition_ids,
+    f"got {aged.condition_ids}",
+)
+
+check(
+    "the neutral follow-up reports the complaint's true age",
+    aged.unresolved_minutes >= 20,
+    f"got {aged.unresolved_minutes}",
+)
+
+# Without the earlier complaint behind it, the same neutral
+# question must stay quiet.
+quiet = session_with(["Any update on this?"])
+
+quiet_result = engine_for().evaluate(
+    "sess-07-quiet",
+    "Any update on this?",
+    neutral_followup,
+    quiet,
+    quiet.messages[0].timestamp + timedelta(minutes=21),
+)
+
+check(
+    "a neutral question with no complaint behind it stays quiet",
+    "ESC-07" not in quiet_result.condition_ids,
+    f"got {quiet_result.condition_ids}",
+)
+
+# An open ticket anchors the clock at its creation, so a
+# conversation that no longer shows the original complaint still
+# ages from the moment it was ticketed.
+ticketed = FakeTicket(
+    priority="P3",
+    created_at=utc(2026, 10, 2, 9, 40),
+)
+
+trimmed = session_with(["Any update on this?"])
+
+ticket_aged = engine_for().evaluate(
+    "sess-07-ticket",
+    "Any update on this?",
+    neutral_followup,
+    trimmed,
+    utc(2026, 10, 2, 10, 5),
+    status="open",
+    ticket=ticketed,
+)
+
+check(
+    "an open ticket anchors the unresolved clock",
+    "ESC-07" in ticket_aged.condition_ids,
+    f"got {ticket_aged.condition_ids}",
+)
+
+check(
+    "the ticket-anchored clock reads the ticket's age",
+    ticket_aged.unresolved_minutes == 25.0,
+    f"got {ticket_aged.unresolved_minutes}",
+)
+
+resolved_aged = engine_for().evaluate(
+    "sess-07-resolved",
+    "Any update on this?",
+    neutral_followup,
+    trimmed,
+    utc(2026, 10, 2, 10, 5),
+    status="resolved",
+    ticket=ticketed,
+)
+
+check(
+    "a resolved ticket never re-opens the clock",
+    "ESC-07" not in resolved_aged.condition_ids
+    and resolved_aged.unresolved_minutes == 0.0,
+    f"got {resolved_aged.condition_ids} "
+    f"{resolved_aged.unresolved_minutes}",
 )
 
 

@@ -20,6 +20,7 @@ from task6_multilingual import ConversationMessage
 from task7_sentiment import (
     SentimentConfig,
     SentimentLabel,
+    SentimentResult,
     RiskTopic,
     analyse_conversation,
     analyse_message,
@@ -348,6 +349,91 @@ check(
 
 
 # ============================================================
+# 5b. SARCASM REGRESSIONS (PRIDE WRAPPED ROUND A COMPLAINT)
+#
+# A code review found these three reading as satisfied or neutral:
+# praise words attached to a complaint outscore the complaint in
+# the lexicon, so "thanks so much for ignoring my ticket" sailed
+# through as POSITIVE at confidence 1.0 and the tone block told
+# the model the customer was happy. They are detected now through
+# the explicit constructions and the praise-plus-complaint
+# polarity mismatch, and must come out negative-family with real
+# confidence and never a warm/satisfied tone instruction.
+# ============================================================
+
+print("\n[5b] SARCASM REGRESSIONS (POLARITY MISMATCH)")
+
+MISMATCH_CASES = [
+    (
+        "Wow, thanks so much for ignoring my ticket for three days. "
+        "Really appreciate it."
+    ),
+    "Yeah right, because that worked so well last time.",
+    "Fantastic, you charged me twice. Love that.",
+]
+
+for text in MISMATCH_CASES:
+
+    result = analyse_message(text)
+
+    label = text.split()[0].lower()
+
+    check(
+        f"regression: mock praise is sarcastic [{label}...]",
+        result.sarcasm is True
+        and result.label
+        in ("sarcastic", "negative", "frustrated", "urgent"),
+        f"got label={result.label} sarcasm={result.sarcasm} "
+        f"score={result.sarcasm_score}",
+    )
+
+    check(
+        f"regression: mock praise is negative in polarity [{label}...]",
+        result.polarity < 0,
+        f"got {result.polarity}",
+    )
+
+    check(
+        f"regression: mock praise carries real confidence [{label}...]",
+        result.confidence >= 0.55,
+        f"got {result.confidence}",
+    )
+
+    tone = build_tone_instruction(result, "english")
+
+    check(
+        f"regression: mock praise never gets a warm tone [{label}...]",
+        "satisfied" not in tone.lower(),
+        tone,
+    )
+
+# Sincere forms that must never flip: a contrastive mixed review is
+# not a mock cheer, and neither is a polite request that happens to
+# name a risk topic.
+mixed = analyse_message(
+    "The delivery was delayed but your support was great."
+)
+
+check(
+    "a contrastive mixed review is not sarcasm",
+    mixed.sarcasm is False,
+    f"got sarcasm={mixed.sarcasm} label={mixed.label}",
+)
+
+polite = analyse_message(
+    "I would appreciate it if you could look into what appears to "
+    "be a duplicate charge on my card, whenever convenient."
+)
+
+check(
+    "a polite request naming a risk topic is not sarcasm",
+    polite.sarcasm is False
+    and polite.label in ("positive", "neutral"),
+    f"got sarcasm={polite.sarcasm} label={polite.label}",
+)
+
+
+# ============================================================
 # 6. CALM HIGH RISK (INDEPENDENT OF POLARITY)
 # ============================================================
 
@@ -456,6 +542,53 @@ check(
     ).risk_severity
     == "critical",
 )
+
+
+# ============================================================
+# 7b. HIGH-RISK PARAPHRASES (SEMANTIC COMPROMISE)
+#
+# The literal phrases above missed calm paraphrases of the same
+# fact: "I think my password was used by someone I do not know"
+# and the Telugu account-hack message both slipped through a
+# regex-over-literal-phrases net. The patterns now recognise the
+# semantics of compromise -- password/account plus used-by /
+# accessed-by / someone else / unknown person / not me -- in calm
+# English and in Telugu/Hindi, native and romanised.
+# ============================================================
+
+print("\n[7b] HIGH-RISK PARAPHRASES")
+
+COMPROMISE_PARAPHRASES = [
+    "I think my password was used by someone I do not know",
+    "My account was accessed by somebody I do not know",
+    "Someone logged into my account from another device",
+    "I did not log in yesterday",
+    "The login from last night was not me",
+    "నా ఖాతా హ్యాక్ అయింది, ఎవరో నా ఖాతాలోకి లాగిన్ అయ్యారు",
+    "naa khata hack ayyindi, evado naa account loki login ayyaru",
+    "मेरा खाता हैक हो गया, किसी ने मेरा पासवर्ड इस्तेमाल किया",
+    "kisi ne mera password use kiya",
+]
+
+for text in COMPROMISE_PARAPHRASES:
+
+    matches = detect_high_risk_topics(text)
+
+    topics = [match["topic"] for match in matches]
+
+    check(
+        f"compromise paraphrase flagged: {text[:45]!r}",
+        "account_compromise" in topics,
+        f"got {topics}",
+    )
+
+    result = analyse_message(text)
+
+    check(
+        f"compromise paraphrase is critical severity: {text[:45]!r}",
+        result.risk_severity == "critical",
+        f"got {result.risk_severity}",
+    )
 
 
 # ============================================================
@@ -642,6 +775,118 @@ check(
     "tone instruction uses the display language name",
     "Respond in Hindi" in hindi_tone,
     hindi_tone,
+)
+
+
+# ============================================================
+# 12. THE LLM FALLBACK SEAM
+#
+# The module's docstring promises a second opinion for
+# low-confidence messages; the seam is one optional, injectable
+# hook. It must be None by default (so nothing changes offline and
+# no real API is ever called), fire only below the configured
+# confidence threshold, and degrade gracefully when it declines.
+# ============================================================
+
+print("\n[12] LLM FALLBACK SEAM")
+
+check(
+    "no fallback hook is configured by default",
+    SentimentConfig().llm_fallback is None,
+)
+
+default_low = analyse_message("Where is my invoice please")
+
+check(
+    "without a hook the low-confidence result stands unchanged",
+    default_low.label == SentimentLabel.NEUTRAL.value
+    and default_low.confidence == config.neutral_default_confidence,
+    f"got {default_low.label} conf={default_low.confidence}",
+)
+
+hook_calls = []
+
+
+def recording_fallback(text, language, preliminary):
+
+    hook_calls.append({"text": text, "language": language})
+
+    return SentimentResult(
+        label=SentimentLabel.NEGATIVE.value,
+        confidence=0.9,
+        polarity=-0.8,
+    )
+
+
+fallback_config = SentimentConfig(
+    minimum_confidence=0.60,
+    llm_fallback=recording_fallback,
+)
+
+low = analyse_message(
+    "Where is my invoice please", config=fallback_config
+)
+
+check(
+    "the hook fires for a below-threshold confidence",
+    len(hook_calls) == 1
+    and hook_calls[0]["text"] == "Where is my invoice please",
+    f"got {hook_calls}",
+)
+
+check(
+    "the hook is consulted with the message and its language",
+    hook_calls[0]["language"] == "english",
+    f"got {hook_calls[0]}",
+)
+
+check(
+    "the hook's result replaces the rule-based one",
+    low.label == SentimentLabel.NEGATIVE.value
+    and low.confidence == 0.9
+    and low.polarity == -0.8,
+    f"got label={low.label} conf={low.confidence} "
+    f"pol={low.polarity}",
+)
+
+check(
+    "the second opinion is recorded in the evidence",
+    any("llm fallback" in item for item in low.evidence),
+    f"got {low.evidence}",
+)
+
+confident = analyse_message(
+    "This is terrible service, my order is broken and late.",
+    config=fallback_config,
+)
+
+check(
+    "a confident result never calls the hook",
+    len(hook_calls) == 1,
+    f"got {len(hook_calls)} calls",
+)
+
+check(
+    "a confident result keeps the rule-based classification",
+    confident.label == SentimentLabel.NEGATIVE.value
+    and confident.sarcasm is False,
+    f"got {confident.label}",
+)
+
+declining_config = SentimentConfig(
+    minimum_confidence=0.60,
+    llm_fallback=lambda text, language, preliminary: None,
+)
+
+declined = analyse_message(
+    "Where is my invoice please", config=declining_config
+)
+
+check(
+    "a hook that declines keeps the rule-based result",
+    declined.label == SentimentLabel.NEUTRAL.value
+    and declined.confidence == config.neutral_default_confidence,
+    f"got {declined.label} conf={declined.confidence}",
 )
 
 

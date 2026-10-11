@@ -9,6 +9,9 @@ Covers:
 - Multiple requests
 - Corrections
 - Low-confidence clarification
+- Short follow-ups inheriting the session's established language
+- Unsupported languages flagged explicitly, not guessed
+- Labelled names extracted; emails and codes never yield a name
 - 10-message context
 - Session isolation
 - 30-minute inactivity
@@ -23,6 +26,7 @@ from task6_multilingual import (
     Task6Config,
     build_session_summary,
     detect_language,
+    extract_person_names,
     extract_preserved_entities,
     preserve_entities,
     detect_multiple_requests,
@@ -722,6 +726,335 @@ check(
         long_manager.sessions["long_user"], max_messages=0
     )
     == "",
+)
+
+
+# ============================================================
+# 19. SHORT FOLLOW-UPS INHERIT THE SESSION LANGUAGE
+# ============================================================
+
+print("\n[19] CONTEXT-AWARE FOLLOW-UPS")
+
+followup_manager = SessionManager(
+    Task6Config(max_context_messages=10)
+)
+
+followup_manager.add_user_message(
+    "followup_user",
+    "My order ORD-12345 has not arrived.",
+)
+
+# Each of these is the natural next message inside an established
+# session. None of them carries a language of its own, so each must
+# continue the session's language instead of falling to "unknown"
+# and triggering the low-confidence clarification.
+
+for followup in ["yes", "ORD-1234", "ok thanks"]:
+
+    result = followup_manager.add_user_message(
+        "followup_user",
+        followup,
+    )
+
+    check(
+        f"Short follow-up inherits the session language: {followup!r}",
+        result["language"]["language"] == "english"
+        and result["language"]["confidence"] >= 0.55
+        and not result["clarification_required"],
+        str(result["language"]),
+    )
+
+bare_id_result = followup_manager.add_user_message(
+    "followup_user",
+    "ORD-5678",
+)
+
+check(
+    "a bare order id is a valid in-context reply, never low-confidence",
+    not bare_id_result["clarification_required"]
+    and bare_id_result["language"]["language"] == "english"
+    and "ORD-5678" in bare_id_result["entities"]["order_id"],
+    str(bare_id_result),
+)
+
+# A bare identifier is never a language problem even in a brand-new
+# session: it is the answer to the assistant's own question, so it
+# must not be rejected with a clarification.
+
+fresh_id_manager = SessionManager(Task6Config())
+
+fresh_id_result = fresh_id_manager.add_user_message(
+    "fresh_id_user",
+    "ORD-1234",
+)
+
+check(
+    "a bare order id is never rejected, even with no session language",
+    not fresh_id_result["clarification_required"]
+    and "ORD-1234" in fresh_id_result["entities"]["order_id"],
+    str(fresh_id_result),
+)
+
+# A Hindi-speaking customer's single-word "yes" continues their
+# Hindi conversation instead of tripping the clarification.
+
+hindi_followup_manager = SessionManager(Task6Config())
+
+hindi_followup_manager.add_user_message(
+    "hindi_followup_user",
+    "मेरा ऑर्डर अभी तक नहीं आया है",
+)
+
+haan_result = hindi_followup_manager.add_user_message(
+    "hindi_followup_user",
+    "Haan",
+)
+
+check(
+    "'Haan' continues a hindi session without clarification",
+    haan_result["language"]["language"] == "hindi"
+    and not haan_result["clarification_required"],
+    str(haan_result["language"]),
+)
+
+check(
+    "'Haan' is recognised as hindi on its own",
+    detect_language("Haan")["language"] == "hindi",
+    str(detect_language("Haan")),
+)
+
+# The inheritance must not swallow genuinely ambiguous first
+# messages: with no session language to inherit, a bare "yes" is
+# still unknown and still asks for clarification.
+
+fresh_yes_manager = SessionManager(Task6Config())
+
+fresh_yes_result = fresh_yes_manager.add_user_message(
+    "fresh_yes_user",
+    "yes",
+)
+
+check(
+    "an ambiguous first message with no session still clarifies",
+    fresh_yes_result["clarification_required"],
+    str(fresh_yes_result["language"]),
+)
+
+# A message with neither words nor identifiers -- bare punctuation --
+# has nothing to inherit, so it stays a clarification even inside
+# an established session.
+
+punctuation_result = followup_manager.add_user_message(
+    "followup_user",
+    "??",
+)
+
+check(
+    "punctuation-only stays a clarification even in a session",
+    punctuation_result["clarification_required"],
+    str(punctuation_result["language"]),
+)
+
+
+# ============================================================
+# 20. UNSUPPORTED LANGUAGES ARE FLAGGED, NOT GUESSED
+# ============================================================
+
+print("\n[20] UNSUPPORTED LANGUAGES")
+
+french_message = (
+    "Bonjour, je veux un remboursement pour ma commande"
+)
+
+french_result = detect_language(french_message)
+
+check(
+    "a french message is flagged unsupported, not answered as spanish",
+    french_result["language"] == "unsupported"
+    and french_result.get("unsupported") is True
+    and french_result.get("unsupported_language") == "french"
+    and french_result["clarification_required"],
+    str(french_result),
+)
+
+german_result = detect_language(
+    "Ich möchte eine Rückerstattung für meine Bestellung"
+)
+
+check(
+    "a german message is flagged unsupported",
+    german_result["language"] == "unsupported"
+    and german_result.get("unsupported_language") == "german"
+    and german_result["clarification_required"],
+    str(german_result),
+)
+
+script_result = detect_language("我的订单还没有到")
+
+check(
+    "a message in an unsupported script is flagged",
+    script_result["language"] == "unsupported"
+    and script_result.get("unsupported") is True
+    and script_result["clarification_required"],
+    str(script_result),
+)
+
+# The unsupported signal survives inside an established session: it
+# is never silently inherited past, because the customer has
+# switched to a language the product cannot answer in.
+
+unsupported_session_manager = SessionManager(Task6Config())
+
+unsupported_session_manager.add_user_message(
+    "unsupported_user",
+    "My order ORD-12345 has not arrived.",
+)
+
+unsupported_result = unsupported_session_manager.add_user_message(
+    "unsupported_user",
+    french_message,
+)
+
+check(
+    "an unsupported language still clarifies inside a session",
+    unsupported_result["clarification_required"]
+    and unsupported_result["language"]["language"] == "unsupported",
+    str(unsupported_result["language"]),
+)
+
+# A supported message must never be flagged by mistake: the spanish
+# sample is answered in spanish, not sent to clarification.
+
+spanish_check_result = detect_language(
+    "Necesito ayuda con mi pedido"
+)
+
+check(
+    "a supported message is never flagged unsupported",
+    spanish_check_result["language"] == "spanish"
+    and not spanish_check_result.get("unsupported")
+    and not spanish_check_result["clarification_required"],
+    str(spanish_check_result),
+)
+
+
+# ============================================================
+# 21. TRANSLITERATED TELUGU CONFIDENCE
+# ============================================================
+
+print("\n[21] TRANSLITERATED TELUGU CONFIDENCE")
+
+telugu_result = detect_language("Naa order inka raaledu")
+
+check(
+    "romanised telugu is detected with sensible confidence",
+    telugu_result["language"] == "telugu"
+    and telugu_result["confidence"] >= 0.55
+    and not telugu_result["clarification_required"],
+    str(telugu_result),
+)
+
+check(
+    "romanised telugu may be mixed but never a clarification",
+    telugu_result["mixed"] is True
+    and "telugu" in telugu_result["detected_languages"],
+    str(telugu_result),
+)
+
+
+# ============================================================
+# 22. LABELLED NAMES ARE EXTRACTED
+# ============================================================
+
+print("\n[22] LABELLED NAMES")
+
+# Each of these is a customer giving their name in a form a ticket
+# needs: without the extraction, the ticket asks the customer for a
+# name they already gave.
+
+labelled_name_tests = [
+    ("Name Anil Rao anil@x.com", "Anil Rao"),
+    ("my name is Priya Sharma", "Priya Sharma"),
+    ("I am Ravi Kumar", "Ravi Kumar"),
+    ("this is Sana Ali", "Sana Ali"),
+    ("name: Anil Rao", "Anil Rao"),
+]
+
+for text, expected in labelled_name_tests:
+
+    names = extract_person_names(text)
+
+    check(
+        f"Labelled name extracted: {text!r}",
+        expected in names,
+        f"expected {expected!r} in {names}",
+    )
+
+# The labelled name survives into the full entity extraction that
+# feeds the ticket's customer_name.
+
+labelled_entities = extract_preserved_entities(
+    "Name Anil Rao anil@x.com"
+)
+
+check(
+    "a labelled name reaches extract_preserved_entities",
+    "Anil Rao" in labelled_entities.get("person_name", []),
+    str(labelled_entities.get("person_name")),
+)
+
+# An email address must never yield a person name: not its local
+# part, not the words that follow it.
+
+for text, expected in [
+    ("my name is Anil Anil.Rao@x.com", ["Anil"]),
+    ("Email anil.rao@x.com", []),
+    ("Email anil.rao@x.com Name Anil Rao", ["Anil Rao"]),
+    ("contact priya.sharma@example.com", []),
+]:
+
+    names = extract_person_names(text)
+
+    check(
+        f"An email never yields a name: {text!r}",
+        names == expected,
+        f"expected {expected}, got {names}",
+    )
+
+# The words after an order id or a product code are never read as a
+# name: a code fragment is not a person.
+
+for text, expected in [
+    ("this is ORD-12345 status pending", []),
+    ("this is PRD-ABC123 broken", []),
+    ("product SKU-9912 Name Anil Rao", ["Anil Rao"]),
+]:
+
+    names = extract_person_names(text)
+
+    check(
+        f"Words after an identifier are not a name: {text!r}",
+        names == expected,
+        f"expected {expected}, got {names}",
+    )
+
+# A bare capitalised full name with no label stays unextracted:
+# the extractor is conservative, and an ordinary pair of
+# capitalised words is not evidence of a person.
+
+check(
+    "a bare capitalised full name without a label stays conservative",
+    extract_person_names("Anil Rao") == [],
+    str(extract_person_names("Anil Rao")),
+)
+
+# A label that names a thing, not a person, is not a customer name.
+
+check(
+    "a product name is not a person name",
+    extract_person_names("product name Premium Mixer is wrong")
+    == [],
+    str(extract_person_names("product name Premium Mixer is wrong")),
 )
 
 

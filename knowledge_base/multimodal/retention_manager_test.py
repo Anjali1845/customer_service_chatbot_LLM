@@ -240,11 +240,154 @@ with tempfile.TemporaryDirectory() as temp_dir:
     print("RESULT: PASS ✅")
 
 
+    # --------------------------------------------------
+    # TEST 9 - REPEATED CLEANUP IS A CLEAN NO-OP
+    # --------------------------------------------------
+    print("\nTEST 9 - REPEATED CLEANUP NO-OP")
+
+    repeat_storage = Path(temp_dir) / "repeat_storage"
+
+    repeat_manager = RetentionManager(
+        repeat_storage,
+        retention_seconds=10
+    )
+
+    expired_file = create_test_file(
+        repeat_storage / "expired.pdf",
+        content="EXPIRED",
+        age_seconds=20
+    )
+
+    active_file = create_test_file(
+        repeat_storage / "active.pdf",
+        content="STILL ACTIVE",
+        age_seconds=1
+    )
+
+    first_cleanup = repeat_manager.cleanup_expired()
+
+    print("First cleanup:", first_cleanup)
+
+    assert first_cleanup["deleted_count"] == 1
+    assert not expired_file.exists()
+    assert active_file.exists()
+
+    second_cleanup = repeat_manager.cleanup_expired()
+
+    print("Second cleanup:", second_cleanup)
+
+    assert second_cleanup["deleted_count"] == 0
+    assert second_cleanup["error_count"] == 0
+    assert second_cleanup["checked_count"] == 1
+    assert (
+        str(active_file.resolve())
+        in second_cleanup["skipped"]
+    )
+    assert active_file.exists()
+    assert active_file.read_text() == "STILL ACTIVE"
+
+    print("First call deleted the expired file: YES ✅")
+    print("Second call was a clean no-op: YES ✅")
+    print("Active file preserved across both calls: YES ✅")
+    print("RESULT: PASS ✅")
+
+
+    # --------------------------------------------------
+    # TEST 10 - CONCURRENT CLEANUP IS SAFE
+    # --------------------------------------------------
+    print("\nTEST 10 - CONCURRENT CLEANUP SAFETY")
+
+    import threading
+
+    concurrent_storage = Path(temp_dir) / "concurrent_storage"
+
+    concurrent_manager = RetentionManager(
+        concurrent_storage,
+        retention_seconds=10
+    )
+
+    for index in range(5):
+        create_test_file(
+            concurrent_storage / f"expired_{index}.pdf",
+            content="CONCURRENT EXPIRED",
+            age_seconds=20
+        )
+
+    concurrent_active = create_test_file(
+        concurrent_storage / "active.pdf",
+        content="CONCURRENT ACTIVE",
+        age_seconds=1
+    )
+
+    barrier = threading.Barrier(4)
+    cleanup_results = []
+    cleanup_errors = []
+
+    def run_cleanup():
+        try:
+            barrier.wait(timeout=10)
+            cleanup_results.append(
+                concurrent_manager.cleanup_expired()
+            )
+        except Exception as exc:
+            cleanup_errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run_cleanup)
+        for _ in range(4)
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert cleanup_errors == []
+    assert len(cleanup_results) == 4
+
+    total_deleted = sum(
+        result["deleted_count"]
+        for result in cleanup_results
+    )
+
+    # Each expired file is deleted exactly once - no
+    # double-deletion, no misses, no errors.
+    assert total_deleted == 5
+    assert concurrent_active.exists()
+
+    for index in range(5):
+        assert not (
+            concurrent_storage / f"expired_{index}.pdf"
+        ).exists()
+
+    assert all(
+        result["error_count"] == 0
+        for result in cleanup_results
+    )
+
+    # A follow-up call remains a clean no-op.
+    final_cleanup = concurrent_manager.cleanup_expired()
+
+    print("Concurrent results:", cleanup_results)
+    print("Final cleanup:", final_cleanup)
+
+    assert final_cleanup["deleted_count"] == 0
+    assert final_cleanup["error_count"] == 0
+    assert concurrent_active.exists()
+
+    print("Concurrent cleanups deleted each file once: YES ✅")
+    print("No cleanup errors under concurrency: YES ✅")
+    print("Active file preserved under concurrency: YES ✅")
+    print("RESULT: PASS ✅")
+
+
 print("\n" + "=" * 70)
 print("TASK 5.7 REGRESSION TEST COMPLETE")
 print("=" * 70)
-print("ALL 8 RETENTION & DELETION TESTS PASSED ✅")
+print("ALL 10 RETENTION & DELETION TESTS PASSED ✅")
 print("Expired files are removed safely.")
 print("Active files are preserved.")
 print("Outside files cannot be deleted.")
+print("Repeated/concurrent cleanup is a safe no-op.")
 print("=" * 70)

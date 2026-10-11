@@ -34,5 +34,65 @@
     "effective_date": "2026-06-01",
     "expiry_date": null,
     "status": "active"
+  },
+  {
+    "document_id": "KB-005",
+    "filename": "aurora_breeze_guide.txt",
+    "title": "Aurora Breeze Speaker User Guide",
+    "document_version": "1.0",
+    "product": "Aurora Breeze Speaker",
+    "region": "GLOBAL",
+    "access_level": "public",
+    "effective_date": "2026-01-15",
+    "expiry_date": null,
+    "status": "active"
+  },
+  {
+    "document_id": "KB-006",
+    "filename": "aurora_breeze_faq.txt",
+    "title": "Aurora Breeze Speaker FAQ",
+    "document_version": "1.0",
+    "product": "Aurora Breeze Speaker",
+    "region": "EU",
+    "access_level": "public",
+    "effective_date": "2026-02-01",
+    "expiry_date": null,
+    "status": "active"
+  },
+  {
+    "document_id": "KB-007",
+    "filename": "aurora_breeze_troubleshooting.txt",
+    "title": "Aurora Breeze Speaker Troubleshooting Guide",
+    "document_version": "1.0",
+    "product": "Aurora Breeze Speaker",
+    "region": "GLOBAL",
+    "access_level": "public",
+    "effective_date": "2026-03-01",
+    "expiry_date": null,
+    "status": "active"
+  },
+  {
+    "document_id": "KB-008",
+    "filename": "aurora_breeze_guide_v2.txt",
+    "title": "Aurora Breeze Speaker User Guide",
+    "document_version": "2.0",
+    "product": "Aurora Breeze Speaker",
+    "region": "GLOBAL",
+    "access_level": "public",
+    "effective_date": "2027-06-01",
+    "expiry_date": null,
+    "status": "active"
+  },
+  {
+    "document_id": "KB-009",
+    "filename": "customer_tips.txt",
+    "title": "Aurora Breeze Speaker Community Tips",
+    "document_version": "1.0",
+    "product": "Aurora Breeze Speaker",
+    "region": "GLOBAL",
+    "access_level": "public",
+    "effective_date": "2026-02-15",
+    "expiry_date": null,
+    "status": "active"
   }
 ]

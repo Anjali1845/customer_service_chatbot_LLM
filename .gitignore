@@ -25,5 +25,14 @@ metadata.db-journal
 *.task6_backup
 *_backup.py
 
+# Scratch copies of a runtime database taken before a migration.
+metadata.db.*backup*
+support.db.*backup*
+
+# Uploaded documents awaiting multimodal intake. Runtime data, and it
+# holds customer-supplied files, so it never belongs in the repository.
+uploads/
+quarantine/
+
 # macOS
 .DS_Store

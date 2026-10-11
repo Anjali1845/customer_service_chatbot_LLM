@@ -385,6 +385,7 @@ def unresolved_minutes(
     config: Optional[EscalationConfig] = None,
     now: Optional[datetime] = None,
     status: Optional[str] = None,
+    ticket: Optional[object] = None,
 ) -> float:
     """
     How long the conversation has been unresolved.
@@ -402,12 +403,19 @@ def unresolved_minutes(
     from its own text, because a caller's blended history sentiment
     describes the conversation rather than any one turn.
 
+    ``ticket``, when supplied, is read duck-typed: an open ticket
+    carries ``created_at``, and the complaint it was filed for stays
+    outstanding even when the visible conversation starts later than
+    the ticket (a session may hold only the recent turns). The ticket
+    then anchors the clock at its creation, alongside the oldest
+    outstanding complaint in the messages.
+
     Returns 0.0 when:
 
-    * the customer has not spoken,
+    * the customer has not spoken and no open ticket was supplied,
     * the ticket status is already resolved/closed/cancelled,
-    * ``unresolved_requires_negative`` is set and no user turn was
-      negative, or
+    * ``unresolved_requires_negative`` is set, no user turn was
+      negative and no open ticket was supplied, or
     * the clock has not advanced.
     """
 
@@ -457,11 +465,7 @@ def unresolved_minutes(
             message for message in spoken if is_negative(message)
         ]
 
-        if not outstanding:
-
-            return 0.0
-
-        earliest = outstanding[0]
+        earliest = outstanding[0] if outstanding else None
 
     else:
 
@@ -469,9 +473,28 @@ def unresolved_minutes(
 
     moment = as_utc(now)
 
-    started = as_utc(earliest.timestamp)
+    started: Optional[datetime] = None
 
-    if moment <= started:
+    if earliest is not None:
+
+        started = as_utc(earliest.timestamp)
+
+    # An open ticket anchors the clock at its creation: the complaint
+    # a ticket was filed for stays outstanding even when the visible
+    # conversation starts later than the ticket.
+    ticket_created = getattr(ticket, "created_at", None)
+
+    if ticket_created is not None:
+
+        ticket_started = as_utc(ticket_created)
+
+        started = (
+            ticket_started
+            if started is None
+            else min(started, ticket_started)
+        )
+
+    if started is None or moment <= started:
 
         return 0.0
 
@@ -625,7 +648,17 @@ class EscalationEngine:
         function anchors its clock at the *oldest* outstanding
         complaint rather than the newest message. Appending this turn
         therefore cannot reset the wait to zero, and a customer chasing
-        a complaint they raised twenty minutes ago still escalates.
+        a complaint they raised twenty minutes ago still escalates --
+        even when the chasing message itself is neutral, because ESC-07
+        gates on the age of the open complaint plus the negativity of
+        the conversation history, not on the current label alone.
+
+        On a live customer turn, an open ``ticket`` also anchors the
+        unresolved clock at its ``created_at``: the complaint a ticket
+        was filed for stays outstanding even when the visible session
+        starts later. A SLA recalculation -- which passes neither a
+        message nor a session -- is not a live turn, so a re-read of a
+        breached ticket never raises ESC-07 on its own.
         """
 
         config = self.config
@@ -636,8 +669,21 @@ class EscalationEngine:
 
         after_hours = self._after_hours(moment)
 
+        # A live customer turn, not an SLA recalculation: that path
+        # calls evaluate with neither a message nor a session (only
+        # the breached ticket), and ESC-07 is a property of a
+        # customer conversation, not of a ticket being re-read. The
+        # open ticket therefore anchors the unresolved clock only
+        # for live turns.
+        live_turn = bool((message or "").strip()) or bool(messages)
+
         unresolved = unresolved_minutes(
-            messages, sentiment, config, moment, status
+            messages,
+            sentiment,
+            config,
+            moment,
+            status,
+            ticket if live_turn else None,
         )
 
         summary = build_conversation_summary(messages, config)
@@ -797,10 +843,70 @@ class EscalationEngine:
 
             actions.append("Hand the conversation to a human agent.")
 
-        # ESC-07 -- unresolved beyond the limit
+        # ESC-07 -- unresolved beyond the limit.
+        #
+        # The gate is the age of the open complaint plus the
+        # negativity of the conversation history, never the label of
+        # the current message alone: a customer whose complaint has
+        # been open for twenty minutes and who then sends a neutral
+        # "any update?" is exactly the case the limit exists for. The
+        # negativity comes from this turn, from any older customer
+        # turn in the session, or from the open ticket the turn is
+        # evaluated against; the unresolved clock above already
+        # anchors at the oldest outstanding complaint and, on a live
+        # turn, at an open ticket's creation.
+        conversation_negative = (
+            sentiment.label in NEGATIVE_LABELS
+            or sentiment.polarity <= -0.3
+            or sentiment.repeated_negative
+        )
+
+        if not conversation_negative:
+
+            older_turns = [
+                older
+                for older in messages
+                if older.role == "user"
+            ][:-1]
+
+            for older in older_turns:
+
+                analysis = analyse_message(
+                    older.content,
+                    (
+                        older.language
+                        if older.language != "unknown"
+                        else None
+                    ),
+                    config.sentiment_config,
+                    older.timestamp,
+                )
+
+                if (
+                    analysis.label in NEGATIVE_LABELS
+                    or analysis.polarity <= -0.3
+                ):
+
+                    conversation_negative = True
+
+                    break
+
+        ticket_open = (
+            live_turn
+            and ticket is not None
+            and not (
+                status
+                and status.lower() in config.resolved_statuses
+            )
+        )
+
         if (
             unresolved >= config.unresolved_minutes
-            and sentiment.label in NEGATIVE_LABELS
+            and (
+                not config.unresolved_requires_negative
+                or conversation_negative
+                or ticket_open
+            )
         ):
 
             add(

@@ -1,0 +1,27 @@
+AURORA BREEZE SPEAKER - FREQUENTLY ASKED QUESTIONS, EU EDITION (VERSION 1.0)
+
+Questions from EU customers about the Aurora Breeze speaker.
+
+Q: How long does the battery last?
+A: A fully charged Aurora Breeze speaker plays for up to twelve hours at medium volume.
+
+Q: How do I pair the speaker with a second phone?
+A: Hold the Bluetooth button for five seconds, then select "Aurora Breeze" on the new phone. The speaker stores up to eight paired devices.
+
+Q: Can I use the speaker while it charges?
+A: Yes. The speaker continues to play while it charges over USB-C.
+
+Q: Is the speaker waterproof?
+A: No. The speaker is water resistant, so it can handle light rain, but it must not be submerged.
+
+Q: How do I reset the speaker?
+A: Press and hold the reset button for ten seconds. The status light flashes three times and the speaker restarts with factory settings.
+
+Q: What does the warranty cover in the EU?
+A: The warranty covers manufacturing defects for 24 months from the purchase date, in line with EU consumer law. It does not cover water damage or accidental drops.
+
+Q: Where can I find the firmware version?
+A: Open the Aurora companion app, choose your speaker, and select "About". The firmware version appears on that screen.
+
+Q: Can I return the speaker?
+A: Contact the store where you bought the speaker. Returns follow the store's own return terms; the Aurora Breeze warranty covers manufacturing defects only.

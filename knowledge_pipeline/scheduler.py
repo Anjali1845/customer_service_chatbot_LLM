@@ -12,15 +12,27 @@ What a real run does:
    per the shared business calendar (so a Saturday or a configured
    holiday rolls to the next working day rather than activating).
 2. Detects new and modified documents, and leaves unchanged ones alone.
-3. Puts every candidate through the quality gate *before* activation.
-   A document that fails is quarantined with its reason instead of
-   being activated and rolled back later.
-4. Activates, remembering the version it replaced.
+3. Puts every candidate through **security screening** (prompt
+   injection and unmasked sensitive data are rejected before anything
+   else runs) and then the **quality gate** -- structural checks plus,
+   for modifications of documents already serving, a grounding check
+   against the serving corpus. A document that fails either is
+   quarantined, with its reason, and never activated.
+4. Activates, remembering the version it replaced, and **rebuilds the
+   serving index** so the retrieval service actually serves what the
+   metadata row says is active. A rebuild failure is an activation
+   failure: rolled back and retried.
 5. Watches the new version with a health check for
-   ``health_check_window_minutes`` (5 by default) and **auto-rolls back
-   to the previous version if a check fails**.
+   ``health_check_window_minutes`` (5 by default) -- a genuine service
+   probe of the serving index, not just the file check -- and
+   **auto-rolls back to the previous version if a check fails**,
+   rebuilding the index again to match.
 6. Retries a failed activation at 15, then 30, then 60 minutes, and
    gives up after the last one instead of looping forever.
+
+Every run is reported to the pipeline monitor (``log_run``, the default
+monitor of the ``scheduler()`` entry point) once its outcome is
+settled, with measured latency and confidence.
 
 Everything is time-injected (``now=``) and dependency-injected
 (``PipelinePorts``), so the whole schedule -- windows, retries, the
@@ -33,11 +45,16 @@ All public functions take and return timezone-aware UTC datetimes.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 
 # --------------------------------------------------
@@ -149,6 +166,18 @@ class SchedulerConfig:
     health_check_interval_minutes: int = 1
 
     quality_gate_enabled: bool = True
+
+    # When False, candidates skip the security screening port even if
+    # one is wired (the port being None already skips it). A screen
+    # that finds injection content or unmasked sensitive data still
+    # rejects and quarantines the document regardless of this flag.
+    security_screen_enabled: bool = True
+
+    # Whether activation must also rebuild the serving index. Disabling
+    # it is an operator escape hatch for a deployment whose index is
+    # managed elsewhere; the default keeps the metadata row and the
+    # retrieval service from drifting apart.
+    rebuild_index_enabled: bool = True
 
     # When True, a window that falls on a weekend or holiday is skipped
     # and the run waits for the next working day.
@@ -483,6 +512,12 @@ class RunRecord:
 
     notes: List[str] = field(default_factory=list)
 
+    # Real wall-clock seconds the activation attempt took, measured by
+    # the scheduler around ``_activate``. The run's *scheduled* instants
+    # stay on started_at/finished_at (simulated in tests); this is the
+    # measured latency the monitor logs. None until the attempt runs.
+    latency_seconds: Optional[float] = None
+
     # Deliberately unannotated, so it stays a plain class attribute
     # rather than becoming a dataclass field with an __init__ keyword.
     # The scheduler sets it from its live config, so the deadline is
@@ -556,6 +591,7 @@ class RunRecord:
             ),
             "monitoring_complete": self.monitoring_complete,
             "notes": list(self.notes),
+            "latency_seconds": self.latency_seconds,
         }
 
 
@@ -576,6 +612,17 @@ class PipelinePorts:
 
     ``activate`` returns the new version number, and ``rollback``
     takes the version to restore.
+
+    Two later additions, both optional so every existing construction
+    keeps working:
+
+    ``rebuild_index`` rebuilds the serving index once activation has
+    succeeded. It defaults to a no-op (None) so a fake pipeline never
+    touches a vector store; ``default_ports()`` supplies the real one.
+
+    ``security_screen`` screens a candidate before anything else runs:
+    prompt-injection content and unmasked sensitive data are rejected
+    (and quarantined) rather than activated. Also None by default.
     """
 
     detect: Callable[[], Dict[str, List[str]]]
@@ -585,6 +632,13 @@ class PipelinePorts:
     health_check: Callable[[str], Tuple[bool, str]]
     quality_gate: Optional[Callable[[str], Tuple[bool, str]]] = None
     quarantine: Optional[Callable[[str, str], None]] = None
+
+    # Called with no arguments after a successful activation, to make
+    # what was activated actually servable.
+    rebuild_index: Optional[Callable[[], None]] = None
+
+    # (filename) -> (allowed, reason); runs before the quality gate.
+    security_screen: Optional[Callable[[str], Tuple[bool, str]]] = None
 
 
 def _load_module(name: str, path: Path):
@@ -619,9 +673,461 @@ def _load_module(name: str, path: Path):
     return module
 
 
+# --------------------------------------------------
+# the serving index
+# --------------------------------------------------
+
+# Activation used to write a metadata row and stop there: the FAISS
+# index the retrieval service actually reads was never touched, so an
+# "activated" document was invisible to customers until some other
+# process happened to rebuild the index. The two functions below give
+# activation a real index rebuild and the health check a real service
+# probe, without making faiss or langchain a requirement: everything
+# vector-related is imported lazily and only when an embedding
+# function has been injected.
+
+# The dependency-free half of the serving index: a manifest of the
+# documents the index was built from, with their content and hashes,
+# written atomically next to the vector files.
+INDEX_MANIFEST_NAME = "index_manifest.json"
+
+# A probe query for callers without a document at hand; deliberately
+# this support bot's vocabulary.
+DEFAULT_PROBE_QUERY = "refund policy shipping support order"
+
+_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+
+
+def _serving_documents(documents_dir: Path) -> List[Path]:
+    """The active documents: the files in the documents directory."""
+
+    return sorted(
+        (
+            path
+            for path in documents_dir.iterdir()
+            if path.is_file() and not path.name.startswith(".")
+        ),
+        key=lambda path: path.name,
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    """SHA-256 of a file, streamed."""
+
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as handle:
+        while chunk := handle.read(4096):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def _read_text(path: Path) -> str:
+    """Read a document; a binary document is not servable text."""
+
+    return path.read_text(encoding="utf-8")
+
+
+def _probe_tokens(query: Union[str, Sequence[str]]) -> List[str]:
+    """
+    The meaningful tokens of a probe query.
+
+    Word runs of 3+ characters (lightly de-pluralised) and numbers of
+    2+ digits, so "refunds within 30 days" probes for "refund", "30".
+    """
+
+    if isinstance(query, str):
+        tokens = _TOKEN_PATTERN.findall(query.lower())
+    else:
+        tokens = [
+            token.lower()
+            for token in query
+        ]
+
+    meaningful = []
+
+    for token in tokens:
+
+        if token.isdigit():
+
+            if len(token) >= 2:
+                meaningful.append(token)
+
+        elif len(token) >= 3:
+
+            term = token[:-1] if token.endswith("s") and len(token) > 3 else token
+
+            meaningful.append(term)
+
+    return meaningful
+
+
+def _lexical_retrieve(
+    query: Union[str, Sequence[str]],
+    entries: List[Dict[str, str]],
+    k: int = 3,
+) -> List[Dict[str, object]]:
+    """
+    Deterministic lexical retrieval over manifest entries.
+
+    ``entries`` are dicts with ``filename`` and ``content``. Scores by
+    the number of probe tokens contained in each document's text and
+    returns the top ``k`` with score > 0, best first, ties by name.
+    """
+
+    tokens = _probe_tokens(query)
+
+    if not tokens:
+        return []
+
+    scored = []
+
+    for entry in entries:
+
+        content = entry.get("content", "").lower()
+
+        score = sum(1 for token in tokens if token in content)
+
+        if score > 0:
+            scored.append({"filename": entry["filename"], "score": score})
+
+    scored.sort(key=lambda item: (-item["score"], item["filename"]))
+
+    return scored[:k]
+
+
+def _build_faiss_index(
+    documents: List[Path],
+    index_dir: Path,
+    embed_fn: Callable[[str], List[float]],
+) -> None:
+    """
+    Build a real FAISS index over the documents, in the format
+    ``FAISS.load_local`` reads.
+
+    Imports the vector stack *here and nowhere else*: this function is
+    only reached when an embedding function was injected, and the
+    ImportError it raises in an environment without faiss/langchain is
+    exactly the signal to fall back to the manifest index.
+    """
+
+    from langchain_community.vectorstores import FAISS  # noqa: PLC0415
+    from langchain_core.documents import Document  # noqa: PLC0415
+
+    class _InjectedEmbeddings:
+        """Adapt ``embed_fn`` to langchain's Embeddings interface."""
+
+        def __init__(self, fn: Callable[[str], List[float]]):
+            self._fn = fn
+
+        def embed_documents(self, texts):
+            return [self._fn(text) for text in texts]
+
+        def embed_query(self, text):
+            return self._fn(text)
+
+    pages = [
+        Document(
+            page_content=_read_text(path),
+            metadata={"source": path.name, "filename": path.name},
+        )
+        for path in documents
+    ]
+
+    store = FAISS.from_documents(pages, _InjectedEmbeddings(embed_fn))
+
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    store.save_local(str(index_dir))
+
+
+def rebuild_serving_index(
+    documents_dir: Optional[Path] = None,
+    index_dir: Optional[Path] = None,
+    embed_fn: Optional[Callable[[str], List[float]]] = None,
+) -> Dict[str, object]:
+    """
+    Rebuild the serving index from the active documents.
+
+    Call this from the app after the knowledge base changes (the
+    scheduler already calls it via its ``rebuild_index`` port on every
+    activation)::
+
+        from scheduler import rebuild_serving_index
+        rebuild_serving_index(embed_fn=my_embeddings.embed_query)
+
+    ``embed_fn`` maps text to a vector. With it *and* faiss/langchain
+    importable, a real FAISS index (``index.faiss`` + ``index.pkl``,
+    loadable with ``FAISS.load_local``) is written over the documents.
+    Without either, the build degrades to the dependency-free manifest
+    index -- a snapshot of the documents' content and hashes that
+    ``probe_serving_index`` serves and verifies against -- and says so
+    in the returned summary; it never requires the vector stack to be
+    installed.
+
+    Returns ``{"engine", "documents", "index_dir", "notes"}``.
+    """
+
+    documents_dir = Path(
+        documents_dir
+        or (PROJECT_ROOT / "knowledge_base" / "documents")
+    )
+
+    index_dir = Path(
+        index_dir
+        or (documents_dir.parent / "faiss_index")
+    )
+
+    if not documents_dir.is_dir():
+        raise FileNotFoundError(
+            f"Documents directory not found: {documents_dir}"
+        )
+
+    documents = _serving_documents(documents_dir)
+
+    entries = []
+
+    for path in documents:
+
+        content = _read_text(path)
+
+        entries.append(
+            {
+                "filename": path.name,
+                "sha256": _sha256_file(path),
+                "bytes": path.stat().st_size,
+                "content": content,
+            }
+        )
+
+    engine = "manifest"
+    notes: List[str] = []
+
+    if embed_fn is not None:
+
+        try:
+            _build_faiss_index(documents, index_dir, embed_fn)
+            engine = "faiss"
+
+        except ImportError as error:
+            notes.append(
+                "vector stack unavailable "
+                f"({error}); wrote the dependency-free manifest index"
+            )
+
+        except Exception as error:  # noqa: BLE001
+            notes.append(
+                "FAISS build failed "
+                f"({error}); wrote the dependency-free manifest index"
+            )
+
+    manifest = {
+        "engine": engine,
+        "built_at": datetime.now(timezone.utc).isoformat(),
+        "embedder": (
+            getattr(embed_fn, "__name__", "custom")
+            if embed_fn is not None
+            else None
+        ),
+        "documents": entries,
+        "notes": notes,
+    }
+
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = index_dir / INDEX_MANIFEST_NAME
+
+    # Atomic write: a rebuild must never leave a half-written manifest
+    # behind for the health probe to trip over.
+    temporary = manifest_path.with_name(INDEX_MANIFEST_NAME + ".tmp")
+
+    temporary.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    temporary.replace(manifest_path)
+
+    print(
+        f"🧭 Serving index rebuilt ({engine}): "
+        f"{len(entries)} document(s) -> {manifest_path}"
+    )
+
+    return {
+        "engine": engine,
+        "documents": len(entries),
+        "index_dir": str(index_dir),
+        "notes": notes,
+    }
+
+
+def probe_serving_index(
+    index_dir: Optional[Path] = None,
+    documents_dir: Optional[Path] = None,
+    probe_query: Optional[Union[str, Sequence[str]]] = None,
+    embed_fn: Optional[Callable[[str], List[float]]] = None,
+    k: int = 3,
+) -> Tuple[bool, str]:
+    """
+    A genuine service probe: the serving index must exist, load and
+    answer a query with non-empty evidence.
+
+    What it checks, in order:
+
+    1. The index directory exists -- no index, no service.
+    2. The manifest written by ``rebuild_serving_index`` loads, lists
+       at least one document, and (when ``documents_dir`` is given)
+       still matches the documents on disk: a document that changed or
+       vanished since the rebuild is a stale index.
+    3. Retrieval over the indexed documents for ``probe_query``
+       (default: this bot's vocabulary) returns evidence.
+    4. For a FAISS-engine index, when ``embed_fn`` and faiss are both
+       available: the vector index loads and answers the query too.
+
+    Returns ``(healthy, detail)``; the detail explains exactly what was
+    probed so a caller can tell "never deployed" from "broken".
+    """
+
+    documents_dir = (
+        Path(documents_dir)
+        if documents_dir is not None
+        else None
+    )
+
+    if index_dir is None:
+
+        index_dir = (
+            documents_dir.parent / "faiss_index"
+            if documents_dir is not None
+            else PROJECT_ROOT / "knowledge_base" / "faiss_index"
+        )
+
+    else:
+        index_dir = Path(index_dir)
+
+    if not index_dir.is_dir():
+        return False, f"serving index not found at {index_dir}"
+
+    manifest_path = index_dir / INDEX_MANIFEST_NAME
+
+    if not manifest_path.is_file():
+
+        # An index built by another tool (ingest.py's FAISS store, for
+        # instance) has no manifest. It is still the service this
+        # deployment serves from, so verify its files exist and are not
+        # empty rather than declaring a working service down.
+        artifacts = [
+            index_dir / "index.faiss",
+            index_dir / "index.pkl",
+        ]
+
+        if all(path.is_file() and path.stat().st_size > 0 for path in artifacts):
+            return (
+                True,
+                "serving index present "
+                "(structural check; no manifest from this pipeline)",
+            )
+
+        return False, "serving index files are missing or empty"
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    except (OSError, ValueError) as error:
+        return False, f"serving index manifest is unreadable: {error}"
+
+    entries = list(manifest.get("documents") or [])
+
+    if not entries:
+        return False, "serving index is empty (no documents indexed)"
+
+    if documents_dir is not None:
+
+        for entry in entries:
+
+            live = documents_dir / entry["filename"]
+
+            if not live.is_file():
+                return (
+                    False,
+                    "stale serving index: "
+                    f"{entry['filename']} is no longer in the documents "
+                    "directory",
+                )
+
+            if _sha256_file(live) != entry.get("sha256"):
+                return (
+                    False,
+                    "stale serving index: "
+                    f"{entry['filename']} changed since the index was built",
+                )
+
+    query = probe_query if probe_query is not None else DEFAULT_PROBE_QUERY
+
+    evidence = _lexical_retrieve(query, entries, k=k)
+
+    if not evidence:
+        return (
+            False,
+            "probe returned no evidence "
+            f"(query: {query!r})",
+        )
+
+    detail = (
+        "evidence: "
+        + ", ".join(
+            f"{item['filename']} (score {item['score']})"
+            for item in evidence
+        )
+    )
+
+    # The vector-level check when this index is a FAISS one and the
+    # caller can embed. If faiss is simply not installed in *this*
+    # interpreter (the scheduler running under plain python3 while the
+    # app serves with the venv), that is not the service being down;
+    # the lexical evidence above already proved the documents serve.
+    if manifest.get("engine") == "faiss" and embed_fn is not None:
+
+        try:
+            import faiss  # noqa: PLC0415
+
+            vector_index = faiss.read_index(
+                str(index_dir / "index.faiss")
+            )
+
+            if vector_index.ntotal <= 0:
+                return False, "serving vector index is empty"
+
+            import numpy  # noqa: PLC0415  (faiss needs it anyway)
+
+            vector = numpy.array(
+                [embed_fn(query if isinstance(query, str) else " ".join(query))],
+                dtype="float32",
+            )
+
+            distances, ids = vector_index.search(vector, k)
+
+            if len(ids[0]) == 0:
+                return False, "serving vector index returned no results"
+
+            detail = f"vector probe answered; {detail}"
+
+        except ImportError:
+            detail = f"vector probe skipped (faiss not installed); {detail}"
+
+        except Exception as error:  # noqa: BLE001
+            return False, f"serving vector index failed to load: {error}"
+
+    return True, detail
+
+
 def default_ports(
     documents_dir: Optional[Path] = None,
     metadata_db: Optional[Path] = None,
+    index_dir: Optional[Path] = None,
+    quarantine_dir: Optional[Path] = None,
+    embed_fn: Optional[Callable[[str], List[float]]] = None,
 ) -> PipelinePorts:
     """
     The real pipeline, wired to the sibling modules.
@@ -633,17 +1139,37 @@ def default_ports(
     scheduler started from anywhere but the knowledge_pipeline
     directory would have activated versions in a second, empty
     database and reported success.
+
+    ``index_dir`` (default ``<documents_dir>/../faiss_index``) and
+    ``quarantine_dir`` (default ``<documents_dir>/../quarantine``) are
+    likewise resolved next to the documents they describe, so a wiring
+    given a scratch documents directory never writes into the real
+    knowledge base.
+
+    ``embed_fn`` (text -> vector) is what makes the index real: with
+    it, ``rebuild_index`` builds an actual FAISS index; without it (or
+    without faiss/langchain installed) the rebuild degrades to the
+    dependency-free manifest index. The scheduler's own tests run
+    entirely without the vector stack.
     """
 
     import sqlite3
 
     pipeline_dir = Path(__file__).resolve().parent
 
-    documents_dir = (
+    documents_dir = Path(
         documents_dir
         or (PROJECT_ROOT / "knowledge_base" / "documents")
     )
     metadata_db = metadata_db or (PROJECT_ROOT / "metadata.db")
+    index_dir = Path(
+        index_dir
+        or (documents_dir.parent / "faiss_index")
+    )
+    quarantine_dir = Path(
+        quarantine_dir
+        or (documents_dir.parent / "quarantine")
+    )
 
     quality_validator = _load_module(
         "kp_quality_validator", pipeline_dir / "quality_validator.py"
@@ -657,6 +1183,17 @@ def default_ports(
     update_pipeline = _load_module(
         "kp_update_pipeline",
         PROJECT_ROOT / "knowledge_base" / "update_pipeline.py",
+    )
+
+    # Security helpers, loaded the same way: by path, so knowledge_base
+    # never has to be on sys.path and those files are used, not copied.
+    security = _load_module(
+        "kp_security",
+        PROJECT_ROOT / "knowledge_base" / "security.py",
+    )
+    pii_masker = _load_module(
+        "kp_pii_masker",
+        PROJECT_ROOT / "knowledge_base" / "multimodal" / "pii_masker.py",
     )
 
     def _connection():
@@ -714,10 +1251,14 @@ def default_ports(
         )
 
     def health_check(filename: str) -> Tuple[bool, str]:
+        """
+        The document must still be there and still pass the quality
+        gate -- and the retrieval service must be able to serve
+        evidence for it. The gate alone was the old (only) probe; a
+        document that passes its file check while the serving index is
+        missing, stale or silent is not a healthy activation.
+        """
 
-        # The real probe: the document must still be readable and must
-        # still pass the quality gate. Anything that made it past the
-        # gate and cannot now be read is a bad activation.
         path = Path(documents_dir) / filename
 
         if not path.is_file():
@@ -726,21 +1267,175 @@ def default_ports(
 
         passed, message = quality_validator.validate_document(path)
 
-        return passed, message
+        if not passed:
+
+            return False, message
+
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return False, "document is no longer valid UTF-8 text"
+
+        # Probe the service with the document's own key terms: after
+        # activating X, the serving index must answer a query about
+        # X's subject matter with evidence.
+        probe_query = " ".join(
+            quality_validator.extract_key_terms(content)[:8]
+        )
+
+        healthy, detail = probe_serving_index(
+            index_dir=index_dir,
+            documents_dir=documents_dir,
+            probe_query=probe_query,
+            embed_fn=embed_fn,
+        )
+
+        if healthy:
+
+            return True, f"ok (quality gate passed; serving index: {detail})"
+
+        if detail.startswith("serving index not found"):
+
+            # No index has ever been built for this documents
+            # directory. Rather than calling a service that was never
+            # deployed "down", probe retrieval over the active
+            # documents themselves -- still a real check that the
+            # document is retrievable, not just present on disk.
+            entries = [
+                {
+                    "filename": doc.name,
+                    "content": doc.read_text(encoding="utf-8"),
+                }
+                for doc in _serving_documents(documents_dir)
+            ]
+
+            evidence = _lexical_retrieve(probe_query, entries)
+
+            if evidence:
+                return (
+                    True,
+                    "ok (quality gate passed; no serving index built "
+                    "yet -- probed the active documents directly)",
+                )
+
+            return (
+                False,
+                f"service probe returned no evidence for {filename}",
+            )
+
+        return False, f"serving index unhealthy: {detail}"
 
     def quality_gate(filename: str) -> Tuple[bool, str]:
+        """
+        The quality gate, with the grounding stage wired in.
+
+        A brand-new document is checked structurally only: new topics
+        are the point of a new document. A *modification* of a
+        document that is already serving is held to the grounding gate
+        against the rest of the serving corpus, so an update whose
+        content the rest of the knowledge base does not support -- the
+        "reduces accuracy or grounding" case -- is rejected instead of
+        activated.
+        """
 
         # The ports contract passes a filename; validate_document takes
         # a path. Resolving it here is what keeps the gate pointed at
         # the documents directory rather than at the working directory,
         # which is where a bare filename would otherwise land.
-        return quality_validator.validate_document(
-            Path(documents_dir) / filename
-        )
+        path = Path(documents_dir) / filename
+
+        if current_version(filename) > 0 and documents_dir.is_dir():
+
+            corpus = [
+                doc
+                for doc in _serving_documents(documents_dir)
+                if doc.name != filename
+            ]
+
+            return quality_validator.validate_document(
+                path, corpus=corpus
+            )
+
+        return quality_validator.validate_document(path)
 
     def quarantine(filename: str, reason: str) -> None:
+        """
+        Move the offending document out of the documents directory,
+        for real, and record why.
+
+        The old hook only printed, which left a document that had just
+        failed a gate sitting in the serving directory where the next
+        run would detect and process it again. It now lands in
+        ``quarantine_dir`` (created if needed) with the reason in a
+        sidecar ``<filename>.reason`` file, and is never left in place.
+        """
+
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+        source = Path(documents_dir) / filename
+        destination = quarantine_dir / filename
+
+        if source.is_file():
+            shutil.move(str(source), str(destination))
+
+        (quarantine_dir / f"{filename}.reason").write_text(
+            f"{reason}\n", encoding="utf-8"
+        )
 
         print(f"🚧 Quarantined {filename}: {reason}")
+        print(f"Moved to: {destination}")
+
+    def rebuild_index() -> None:
+        """Make what was activated actually servable."""
+
+        rebuild_serving_index(
+            documents_dir=documents_dir,
+            index_dir=index_dir,
+            embed_fn=embed_fn,
+        )
+
+    def security_screen(filename: str) -> Tuple[bool, str]:
+        """
+        Screen a candidate before anything else touches it.
+
+        Two rejections, both using the project's existing helpers
+        (loaded by path, never edited): documents containing
+        prompt-injection instructions, and documents containing
+        *unmasked* sensitive data. Masking is deliberately not done
+        in place here -- a knowledge document that arrives carrying
+        raw customer PII is a submission problem, and quietly
+        rewriting the submitter's file would hide it. The document is
+        rejected with the reason; the masked version can be submitted
+        again.
+        """
+
+        path = Path(documents_dir) / filename
+
+        if not path.is_file():
+
+            return False, "document missing before screening"
+
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return False, "document is not valid UTF-8 text"
+
+        detection = security.detect_prompt_injection(content)
+
+        if detection["detected"]:
+            return False, (
+                "prompt injection suspected in document content: "
+                + ", ".join(detection["matches"])
+            )
+
+        if pii_masker.mask_sensitive_text(content) != content:
+            return False, (
+                "document contains unmasked sensitive data "
+                "(email, phone, card, CVV, UPI or account number); "
+                "mask it before submitting"
+            )
+
+        return True, "security screening passed"
 
     return PipelinePorts(
         detect=detect,
@@ -750,6 +1445,8 @@ def default_ports(
         health_check=health_check,
         quality_gate=quality_gate,
         quarantine=quarantine,
+        rebuild_index=rebuild_index,
+        security_screen=security_screen,
     )
 
 
@@ -814,7 +1511,14 @@ class KnowledgeScheduler:
         exactly one event per run. A run that activated is not reported
         here -- its outcome is not confirmed until the health-check
         window has passed, and ``health_check`` reports it then.
+
+        The wrapper also measures the attempt's real wall-clock time
+        onto ``record.latency_seconds`` -- the value the monitor's
+        latency column is filled from, instead of the literal 0.0 that
+        used to be written there.
         """
+
+        started = time.perf_counter()
 
         record = self._activate(
             now=now,
@@ -822,6 +1526,8 @@ class KnowledgeScheduler:
             attempt_index=attempt_index,
             started_at=started_at,
         )
+
+        record.latency_seconds = time.perf_counter() - started
 
         if record.status in FINAL_STATUSES:
 
@@ -915,6 +1621,24 @@ class KnowledgeScheduler:
 
         for filename in candidates:
 
+            # Security screening comes first: a document carrying
+            # prompt-injection instructions or unmasked sensitive data
+            # never even reaches the quality gate. Rejected documents
+            # are quarantined like any other, with the screen's reason.
+            screened, screen_reason = self._screen(filename)
+
+            if not screened:
+
+                record.quarantined.append(filename)
+
+                record.quarantine_reasons[filename] = screen_reason
+
+                if self.ports.quarantine is not None:
+
+                    self.ports.quarantine(filename, screen_reason)
+
+                continue
+
             if not config.quality_gate_enabled:
 
                 approved.append(filename)
@@ -971,6 +1695,24 @@ class KnowledgeScheduler:
             record.versions[filename] = version
 
             record.activated.append(filename)
+
+        # An activation the serving index never sees is not an
+        # activation: the metadata row and the retrieval service must
+        # not drift apart. Rebuild the index now that every gated
+        # document is in, and treat a rebuild failure exactly like an
+        # activation failure -- roll back and retry.
+        if (
+            failure is None
+            and record.activated
+            and config.rebuild_index_enabled
+        ):
+
+            try:
+                self._rebuild_index()
+
+            except Exception as error:  # noqa: BLE001
+
+                failure = f"serving index rebuild failed: {error}"
 
         if failure is not None:
 
@@ -1328,6 +2070,21 @@ class KnowledgeScheduler:
                     f"Rollback of {filename} failed: {error}"
                 )
 
+        # The serving index still holds the bad activation; it must
+        # serve the restored versions again. Best effort -- the
+        # rollback itself has already succeeded -- but a failure is
+        # recorded rather than silently leaving a stale index.
+        if record.rolled_back:
+
+            try:
+                self._rebuild_index()
+
+            except Exception as error:  # noqa: BLE001
+
+                record.notes.append(
+                    f"Serving index rebuild after rollback failed: {error}"
+                )
+
         record.rollback_reason = detail
 
         record.rollback_minutes = round(
@@ -1361,10 +2118,139 @@ class KnowledgeScheduler:
 
             return False, f"quality gate error: {error}"
 
+    def _screen(self, filename: str) -> Tuple[bool, str]:
+        """
+        Run the security screen.
+
+        A screen that is not wired up is a passthrough (tests and
+        minimal deployments), but a screen that *errors* fails closed:
+        an unreadable document is not "probably fine".
+        """
+
+        if (
+            not self.config.security_screen_enabled
+            or self.ports.security_screen is None
+        ):
+
+            return True, "no security screening configured"
+
+        try:
+
+            return self.ports.security_screen(filename)
+
+        except Exception as error:  # noqa: BLE001
+
+            return False, f"security screening error: {error}"
+
+    def _rebuild_index(self) -> None:
+        """
+        Refresh the serving index; a no-op when no hook is wired.
+
+        Called after a successful activation and again after an
+        automatic rollback, so the retrieval service always serves
+        what the metadata says is active.
+        """
+
+        if self.ports.rebuild_index is None:
+
+            return
+
+        self.ports.rebuild_index()
+
 
 # --------------------------------------------------
 # monitoring bridge
 # --------------------------------------------------
+
+_MONITOR_MODULE = None
+
+
+def _monitor_module():
+    """
+    ``monitor.py``, importable wherever the scheduler was loaded from.
+
+    Plain ``import monitor`` works when this directory is on sys.path
+    (running the file, or the scheduler test); when the scheduler was
+    itself loaded by path -- how an app worker wires it in -- that
+    import fails, so fall back to loading the file by path.
+    """
+
+    global _MONITOR_MODULE
+
+    if _MONITOR_MODULE is not None:
+        return _MONITOR_MODULE
+
+    try:
+        import monitor as module  # noqa: S107 - sibling module
+
+    except ImportError:
+        module = _load_module(
+            "kp_monitor_by_scheduler",
+            Path(__file__).resolve().parent / "monitor.py",
+        )
+
+    _MONITOR_MODULE = module
+
+    return module
+
+
+def _measured_latency(record: RunRecord) -> float:
+    """
+    A real elapsed time for the run, in seconds.
+
+    The scheduler's own wall-clock measurement when it ran the attempt
+    (``record.latency_seconds``), otherwise the run's own timestamps.
+    Zero only when nothing was measured at all -- never the old
+    unconditional literal.
+    """
+
+    if record.latency_seconds is not None:
+
+        return round(record.latency_seconds, 6)
+
+    if record.finished_at is not None:
+
+        elapsed = (
+            record.finished_at - record.started_at
+        ).total_seconds()
+
+        return max(0.0, elapsed)
+
+    return 0.0
+
+
+def _measured_confidence(record: RunRecord) -> float:
+    """
+    A confidence the log can actually stand behind.
+
+    In priority order: the share of the run's health checks that were
+    healthy (the strongest evidence, once the window has run); the
+    share of candidates that passed the gates (a quarantined-only run
+    is a real 0, not a default); 1.0 for a run that found nothing to
+    do and did it cleanly; 0.0 for a skipped run, which verified
+    nothing.
+    """
+
+    if record.health_checks:
+
+        healthy = sum(
+            1 for check in record.health_checks if check.healthy
+        )
+
+        return healthy / len(record.health_checks)
+
+    candidates = len(record.activated) + len(record.quarantined)
+
+    if candidates:
+
+        return len(record.activated) / candidates
+
+    if record.status == STATUS_NO_CHANGES:
+
+        return 1.0
+
+    return 0.0
+
 
 def log_run(
     record: RunRecord,
@@ -1382,11 +2268,15 @@ def log_run(
     the log answers "how many escalations was this update accompanied
     by" instead of asserting zero.
 
-    Wire this in with ``KnowledgeScheduler(ports, config,
-    monitor=log_run)``.
-    """
+    ``latency`` and ``confidence`` are likewise derived from the run
+    when not given: the attempt's measured wall-clock time and the
+    health-check / gate pass ratio, instead of the literal 0.0 that
+    used to be written for every run.
 
-    from monitor import log_pipeline_event
+    This is the default ``monitor`` of the ``scheduler()`` entry
+    point; ``KnowledgeScheduler(ports, config, monitor=log_run)`` for
+    hand-built instances.
+    """
 
     files = ", ".join(
         record.activated
@@ -1395,11 +2285,15 @@ def log_run(
         or ["-"]
     )
 
-    log_pipeline_event(
+    _monitor_module().log_pipeline_event(
         filename=files,
         status=record.status,
-        latency=latency if latency is not None else 0.0,
-        confidence=confidence if confidence is not None else 0.0,
+        latency=latency if latency is not None else _measured_latency(record),
+        confidence=(
+            confidence
+            if confidence is not None
+            else _measured_confidence(record)
+        ),
         escalations=None,
         now=record.finished_at or record.started_at,
         support_db=support_db,
@@ -1415,16 +2309,22 @@ def scheduler(
     now: Optional[datetime] = None,
     ports: Optional[PipelinePorts] = None,
     config: Optional[SchedulerConfig] = None,
+    monitor: Optional[Callable[[RunRecord], None]] = log_run,
 ) -> RunRecord:
     """
     One tick, in the shape the old ``scheduler()`` had.
 
     Kept as a function because that is the name the previous stub
     exposed; it now returns the run record instead of printing.
+
+    ``monitor`` defaults to ``log_run``: this entry point is the one
+    the process actually runs, so a scheduled tick is recorded in the
+    pipeline log by default -- the log used to exist only in tests.
+    Pass a callable to log elsewhere, or ``None`` to stay silent.
     """
 
     scheduler_instance = KnowledgeScheduler(
-        ports or default_ports(), config
+        ports or default_ports(), config, monitor=monitor
     )
 
     return scheduler_instance.activate(now)

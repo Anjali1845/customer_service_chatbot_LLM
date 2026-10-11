@@ -10,9 +10,18 @@ Security properties:
 - Prevents path traversal / outside-directory deletion
 - Provides deletion audit information
 - Does not delete active files
+
+Scheduling:
+- ``cleanup_expired`` is safe to call repeatedly and
+  concurrently (it serializes on an internal lock and treats
+  files already deleted by a previous/concurrent run as
+  skipped, never as errors). How often it runs is left to the
+  caller - e.g. a timer thread or a scheduled job can simply
+  call ``cleanup_expired()``.
 """
 
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -39,6 +48,10 @@ class RetentionManager:
         ).resolve()
 
         self.retention_seconds = retention_seconds
+
+        # Serializes cleanup_expired calls so repeated /
+        # concurrent invocations are safe.
+        self.cleanup_lock = threading.Lock()
 
         # Create managed storage if it doesn't exist.
         self.storage_dir.mkdir(
@@ -169,43 +182,88 @@ class RetentionManager:
         """
         Delete all expired regular files directly under
         managed storage and its subdirectories.
+
+        Designed to be scheduled by the caller and safe to
+        invoke repeatedly and concurrently:
+
+        - Calls are serialized with an internal lock, so two
+          overlapping cleanups never race on the same file.
+        - A file deleted by a previous/concurrent run between
+          listing and deletion is treated as skipped, never as
+          an error.
+        - Non-expired files are never touched.
+
+        Returns a summary dict:
+            deleted_count / deleted  - expired files removed
+            skipped_count / skipped  - files kept (still active,
+                                      already gone, outside
+                                      managed storage)
+            checked_count            - regular files examined
+            error_count / errors     - genuine deletion failures
+            storage_dir              - the managed root cleaned
         """
 
         deleted: List[str] = []
         skipped: List[str] = []
         errors: List[str] = []
 
-        for path in self.storage_dir.rglob("*"):
+        with self.cleanup_lock:
 
-            if not path.is_file():
-                continue
+            if not self.storage_dir.exists():
+                return {
+                    "deleted_count": 0,
+                    "deleted": deleted,
+                    "skipped_count": 0,
+                    "skipped": skipped,
+                    "checked_count": 0,
+                    "error_count": 0,
+                    "errors": errors,
+                    "storage_dir": str(self.storage_dir),
+                }
 
-            if not self._is_managed_file(path):
-                skipped.append(str(path))
-                continue
+            for path in self.storage_dir.rglob("*"):
 
-            try:
-                if self.is_expired(
-                    str(path),
-                    now=now
-                ):
-                    path.unlink()
-                    deleted.append(str(path))
-                else:
+                if not path.is_file():
+                    continue
+
+                if not self._is_managed_file(path):
                     skipped.append(str(path))
+                    continue
 
-            except OSError as exc:
-                errors.append(
-                    f"{path}: {exc}"
-                )
+                try:
+                    if self.is_expired(
+                        str(path),
+                        now=now
+                    ):
+                        # missing_ok: a concurrent/previous run
+                        # may already have removed this file.
+                        path.unlink(missing_ok=True)
+                        deleted.append(str(path))
+                    else:
+                        skipped.append(str(path))
+
+                except (OSError, ValueError) as exc:
+                    if not path.exists():
+                        # Vanished between listing and
+                        # processing - already handled by
+                        # another run.
+                        skipped.append(str(path))
+                    else:
+                        errors.append(
+                            f"{path}: {exc}"
+                        )
 
         return {
             "deleted_count": len(deleted),
             "deleted": deleted,
             "skipped_count": len(skipped),
             "skipped": skipped,
+            "checked_count": (
+                len(deleted) + len(skipped) + len(errors)
+            ),
             "error_count": len(errors),
             "errors": errors,
+            "storage_dir": str(self.storage_dir),
         }
 
 
@@ -418,6 +476,28 @@ if __name__ == "__main__":
         print(
             "Non-expired file content preserved: YES ✅"
         )
+
+
+        # TEST 9
+        print("\nTEST 9 - REPEATED CLEANUP IS A NO-OP")
+
+        expired_left = create_test_file(
+            storage / "expired_left.pdf",
+            age_seconds=20
+        )
+
+        first_cleanup = manager.cleanup_expired()
+        second_cleanup = manager.cleanup_expired()
+
+        assert first_cleanup["deleted_count"] >= 1
+        assert not expired_left.exists()
+
+        assert second_cleanup["deleted_count"] == 0
+        assert second_cleanup["error_count"] == 0
+        assert protected.exists()
+
+        print("First cleanup deleted expired files: YES ✅")
+        print("Second cleanup was a clean no-op: YES ✅")
 
 
     print("\n" + "=" * 70)

@@ -16,7 +16,11 @@ from datetime import date, datetime, time, timezone
 
 import streamlit as st
 
-from langchain_helper import create_vector_db, get_qa_chain
+from langchain_helper import create_vector_db
+
+from secure_answer import build_answer_fn
+
+from document_intake import process_upload, run_retention_cleanup
 
 from business_calendar import BusinessCalendarConfig
 from support_flow import SupportFlow, SupportFlowConfig
@@ -109,6 +113,14 @@ elif existing_session.closed:
         session_manager.create_session(session_id)
 
 
+# Uploaded documents are kept for a bounded time and then deleted.
+# RetentionManager refuses to schedule its own sweep, so the app runs
+# it here, once per browser session -- which is what makes retention
+# actually happen rather than being a method nothing ever calls.
+if "retention_sweep" not in st.session_state:
+    st.session_state.retention_sweep = run_retention_cleanup()
+
+
 # ============================================================
 # SIDEBAR -- RUNTIME CONTROLS
 # ============================================================
@@ -193,6 +205,22 @@ if st.sidebar.button("🔄 Recalculate every open ticket"):
 
 st.sidebar.divider()
 
+st.sidebar.header("🔐 Knowledge-base access")
+
+st.sidebar.caption(
+    "Answers are retrieved through the authorised RAG layer, which "
+    "filters documents by access level and effective date. Change "
+    "the viewer to watch a restricted policy appear or vanish."
+)
+
+viewer_access_level = st.sidebar.selectbox(
+    "Answer as",
+    options=("public", "internal", "restricted"),
+    index=0,
+)
+
+st.sidebar.divider()
+
 st.sidebar.header("👥 Agents on shift")
 
 for agent in flow.agents:
@@ -206,6 +234,60 @@ for agent in flow.agents:
     st.sidebar.caption(
         f"load {agent.active_tickets}/{agent.max_capacity}"
     )
+
+st.sidebar.divider()
+
+st.sidebar.header("📎 Document intake")
+
+st.sidebar.caption(
+    "Attach a PDF or image a customer sent. It is validated, "
+    "security-scanned, read by OCR, compared against the message and "
+    "masked before anything is shown."
+)
+
+uploaded_file = st.sidebar.file_uploader(
+    "Attach a document",
+    type=("pdf", "png", "jpg", "jpeg", "webp"),
+)
+
+upload_message = st.sidebar.text_input(
+    "What did the customer say about it?",
+    key="upload_message",
+)
+
+if "intake_result" not in st.session_state:
+    st.session_state.intake_result = None
+
+if uploaded_file is not None:
+
+    # Re-process only when a different file arrives; Streamlit
+    # re-runs the script on every interaction, and the pipeline does
+    # real work (OCR, scanning), so it must not run on each rerun.
+    signature = (uploaded_file.name, uploaded_file.size)
+
+    if st.session_state.get("intake_signature") != signature:
+
+        with st.sidebar.spinner("Processing the upload..."):
+
+            st.session_state.intake_result = process_upload(
+                uploaded_file.name,
+                uploaded_file.getvalue(),
+                message=upload_message,
+            )
+
+        st.session_state.intake_signature = signature
+
+        # Sweep again after every upload, so a long-lived tab keeps
+        # deleting expired documents rather than only doing it once.
+        st.session_state.retention_sweep = run_retention_cleanup()
+
+sweep = st.session_state.get("retention_sweep") or {}
+
+st.sidebar.caption(
+    f"🗑 Retention sweep: {sweep.get('deleted_count', 0)} expired "
+    f"deleted · {sweep.get('skipped_count', 0)} still within "
+    f"retention"
+)
 
 st.sidebar.divider()
 
@@ -394,6 +476,137 @@ def render_turn_detail(result) -> None:
                 st.code(ticket.masked_handoff or "—")
 
 
+def _note_text(event) -> str:
+    """
+    A notification event as one readable line.
+
+    The pipeline emits dicts carrying ``type``/``message``/``reason``,
+    but the renderer must not depend on that exactly, so anything
+    unexpected is stringified rather than dropped.
+    """
+
+    if isinstance(event, dict):
+
+        for key in ("message", "reason", "type"):
+
+            value = event.get(key)
+
+            if value:
+
+                return str(value)
+
+        return str(event)
+
+    return str(event)
+
+
+def render_intake(result) -> None:
+    """
+    Draw the outcome of one document upload.
+
+    Everything shown here is the masked copy: the raw extracted text
+    stays in the result for evidence, but the panel is a handoff
+    surface, so it renders ``masked_text`` and ``masked``.
+    """
+
+    if not result:
+        return
+
+    with st.expander("📎 Document intake", expanded=True):
+
+        for event in result.get("notifications") or []:
+            st.warning(_note_text(event))
+
+        if not result.get("ok"):
+
+            st.error(
+                result.get("reason") or "The upload was rejected."
+            )
+
+            return
+
+        elapsed = result.get("elapsed_seconds")
+
+        st.success(
+            "The document was accepted and processed"
+            + (f" in {elapsed}s." if elapsed is not None else ".")
+        )
+
+        if result.get("clarification_required"):
+            st.info(
+                "The document was hard to read — a follow-up question "
+                "is needed before it can be relied on."
+            )
+
+        structured = result.get("structured_data")
+
+        if structured:
+
+            st.markdown("**Extracted fields**")
+
+            st.json(structured)
+
+        comparison = result.get("comparison")
+
+        if comparison:
+
+            # Surface conflicts and clarifications as first-class
+            # messages, not only inside the JSON. The top-level
+            # clarification flag tracks OCR legibility, so a mismatch
+            # between the message and the document has to be drawn
+            # from the comparison itself.
+            for conflict in comparison.get("conflicts") or []:
+                st.error(f"Conflict: {_note_text(conflict)}")
+
+            clarifications = comparison.get("clarifications") or []
+
+            if clarifications:
+                st.info(
+                    "The message and the document disagree or one is "
+                    "missing a value — ask about: "
+                    + ", ".join(str(c) for c in clarifications)
+                )
+
+            st.markdown("**Message vs document**")
+
+            st.json(comparison)
+
+        masked_text = result.get("masked_text")
+
+        if masked_text:
+
+            st.markdown("**Document text (masked)**")
+
+            st.code(masked_text)
+
+        elif result.get("text"):
+
+            st.caption(
+                "No readable text was extracted from the document."
+            )
+
+        validation = result.get("validation")
+
+        if validation:
+
+            st.caption(f"Validation: {validation.get('reason') or 'passed'}")
+
+        security = result.get("security")
+
+        if security:
+
+            st.caption(
+                "Security scan: "
+                + str(security.get("reason") or "no threats found")
+            )
+
+
+# Draw the last upload, if there was one. The result is kept on the
+# session because the pipeline does real work and must not be re-run
+# by the rerun at the end of every turn.
+render_intake(st.session_state.get("intake_result"))
+
+
 # ============================================================
 # DISPLAY PREVIOUS CONVERSATION
 # ============================================================
@@ -451,9 +664,9 @@ if question:
                 session_id,
                 question,
                 now=now,
-                answer_fn=lambda enriched, tone: get_qa_chain(
-                    tone_instruction=tone
-                ).invoke({"query": enriched})["result"],
+                answer_fn=build_answer_fn(
+                    user_access_level=viewer_access_level
+                ),
             )
 
         # ----------------------------------------------------

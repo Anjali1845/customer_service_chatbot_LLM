@@ -17,9 +17,11 @@ Two design points matter more than the rest:
    keeps its pre-sarcasm label in ``underlying_label`` and keeps a
    negative polarity, so downstream escalation still fires.
 
-Everything is deterministic and offline. The optional LLM fallback
-lives in support_flow, not here, so this module can always run
-without an API key.
+Everything is deterministic and offline. An optional, injectable
+LLM fallback hook (``SentimentConfig.llm_fallback``) gives callers
+a seam for a second opinion on low-confidence messages; it is None
+by default, so this module always runs without an API key and its
+behaviour is unchanged unless a hook is supplied.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import re
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from task6_multilingual import (
     ConversationMessage,
@@ -110,6 +112,13 @@ class SentimentConfig:
     # opinion. The rule layer always clamps the final answer.
     minimum_confidence: float = 0.40
 
+    # Optional second opinion for results below that confidence.
+    # Called as ``llm_fallback(text, language, preliminary)`` and may
+    # return a replacement SentimentResult, or None to keep the
+    # rule-based one. None by default: no hook, no API call, fully
+    # deterministic offline behaviour.
+    llm_fallback: Optional[Callable] = None
+
     # Confidence returned when no marker fires at all.
     neutral_default_confidence: float = 0.55
 
@@ -126,6 +135,11 @@ class SentimentConfig:
     sarcasm_min_score: float = 0.55
     sarcasm_positive_weight: float = 0.20
     sarcasm_base_score: float = 0.45
+
+    # Weight a praise-plus-complaint polarity mismatch earns on its
+    # own ("Fantastic, you charged me twice."): praise words fired as
+    # a mock cheer while the same sentence carries a complaint.
+    sarcasm_mismatch_weight: float = 0.75
 
     repeated_negative_window: int = 4
     repeated_negative_count: int = 2
@@ -613,6 +627,32 @@ SARCASM_PATTERNS: Dict[str, Tuple[Tuple[str, float], ...]] = {
             r"\b(never|not|no)\b",
             0.70,
         ),
+        # Mock dismissals and gratitude aimed at a complaint. "Yeah
+        # right" mocks on its own; the others carry the complaint
+        # inside the match, so sincere praise ("thanks so much for
+        # resolving this") never trips them.
+        (r"\byeah,? right\b", 0.80),
+        (
+            r"\b(thanks|thank you)\b[^.!?]{0,30}\bfor\b[^.!?]{0,40}"
+            r"\b(ignor\w+|no response|no update|nothing|no help|"
+            r"delay\w*|charged me twice|charging me twice)\b",
+            0.80,
+        ),
+        (
+            r"\b(fantastic|great|wonderful|brilliant|awesome|lovely|"
+            r"perfect|amazing)\b[^.!?]{0,50}\b(charged|billed|debited|"
+            r"deducted)\b[^.!?]{0,20}\b(twice|two times|2 times|"
+            r"double)\b",
+            0.75,
+        ),
+        (
+            r"\b(because|after)\b[^.!?]{0,50}\bworked\s+so\s+well\b",
+            0.75,
+        ),
+        (
+            r"\bworked\s+so\s+well\b[^.!?]{0,25}\blast\s+time\b",
+            0.75,
+        ),
     ),
 
     "hindi": (
@@ -652,6 +692,47 @@ SARCASM_PATTERNS: Dict[str, Tuple[Tuple[str, float], ...]] = {
 }
 
 
+# The polarity mismatch: exclamation-grade praise sharing a sentence
+# with a complaint. Only the mock-cheer words are praise markers --
+# never the polite-request grade ("appreciate", "thank you"), so a
+# calm "I would appreciate it if you could look into a duplicate
+# charge" is never mistaken for sarcasm.
+SARCASM_PRAISE_MARKERS: Tuple[str, ...] = (
+    r"\bwow\b",
+    r"\bgreat\b",
+    r"\bfantastic\b",
+    r"\bwonderful\b",
+    r"\bbrilliant\b",
+    r"\bawesome\b",
+    r"\blovely\b",
+    r"\bperfect\b",
+    r"\bamazing\b",
+)
+
+# Complaint contexts that contradict the praise they share a
+# sentence with.
+SARCASM_COMPLAINT_CONTEXTS: Tuple[str, ...] = (
+    r"\bignor\w+\b",
+    r"\b(?:charged|billed|debited|deducted)\b[^.!?]{0,20}"
+    r"\b(?:twice|two times|2 times|double)\b",
+    r"\bworked\s+so\s+well\b",
+    r"\bstill\s+(?:not|no|waiting)\b",
+    r"\bno\s+response\b",
+    r"\bbroken\b",
+    r"\bmissing\b",
+    r"\bdelay\w+\b",
+    r"\blost\s+my\b",
+)
+
+# A contrast cancels the mismatch: "the delivery was delayed but
+# your support was great" is a mixed review, not a mock cheer.
+SARCASM_CONTRAST_MARKERS: Tuple[str, ...] = (
+    r"\bbut\b",
+    r"\bhowever\b",
+    r"\bthough\b",
+)
+
+
 # High-risk topics. Matched against raw text, never against the
 # sentiment label, so calm phrasing still escalates.
 RISK_PATTERNS: Dict[str, Tuple[str, ...]] = {
@@ -666,14 +747,40 @@ RISK_PATTERNS: Dict[str, Tuple[str, ...]] = {
         r"(someone|somebody).{0,20}(accessed|used|logged into).{0,15}my account",
         r"password (was )?(changed|reset) without",
         r"otp .{0,25}without my",
+        # Semantic compromise, however calmly phrased: password or
+        # account plus used-by / accessed-by / someone else /
+        # unknown person / not-me, in any voice.
+        r"(password|passwd|account)[^.]{0,50}\b(used|accessed|"
+        r"viewed|tried)[^.]{0,25}\bby\b[^.]{0,25}\b(someone|"
+        r"somebody|another|unknown|stranger)",
+        r"(someone|somebody)[^.]{0,25}\b(else )?(used|uses|has used|"
+        r"accessed|is using|been using|using|tried)[^.]{0,30}\b"
+        r"(my |the )?(password|account|email)",
+        r"someone (else )?(logged|signed) ?(in|into)",
+        r"\b(i|we) (did ?n[o']?t|did not|never)\b[^.]{0,25}\b"
+        r"(login|log in|sign in|signed in)\b",
+        r"(login|logins|access|password|activity)[^.]{0,25}"
+        r"(was )?not (me|mine)\b",
+        r"(unknown|unrecogni[sz]ed) (person|device)[^.]{0,30}"
+        r"(account|password|access)",
         r"अकाउंट.{0,12}(हैक|चोरी|हैक हो)",
         r"बिना (बताए|अनुमति|पूछे).{0,15}पासवर्ड",
         r"अनधिकृत (पहुंच|लॉगिन)",
         r"mera account hack",
         r"account hack ho gaya",
         r"bina permission password",
+        r"(किसी ने|किसीने).{0,30}(पासवर्ड|खाता|अकाउंट|password|account)",
+        r"(मेरा|मेरी).{0,15}(खाता|अकाउंट|पासवर्ड).{0,30}(हैक|चोरी|किसी ने)",
+        r"(मेरा|मेरी) पासवर्ड.{0,30}(इस्तेमाल|उपयोग)",
+        r"kisi ne.{0,30}(mera|meri|password|account|khata)",
         r"అకౌంట్.{0,12}హ్యాక్",
         r"అనుమతి లేకుండా.{0,15}పాస్వర్డ్",
+        r"ఖాతా.{0,20}హ్యాక్",
+        r"హ్యాక్.{0,20}ఖాతా",
+        r"ఎవరో.{0,30}(లాగిన్|ప్రవేశించ|వాడి|ఉపయోగించ)",
+        r"(ఖాతా|పాస్వర్డ్).{0,30}(ఎవరో|వాడినారు|ఉపయోగించారు)",
+        r"naa (khata|password|account).{0,25}(hack|vadaru|vadina|use)",
+        r"(evado|evaro|evadu).{0,30}(naa )?(account|password|khata|login)",
         r"naa account hack",
         r"cuenta.{0,18}(hackeada|comprometida|robada)",
         r"acceso no autorizado",
@@ -1123,6 +1230,43 @@ def _flip(label_name: str) -> str:
     return label_name
 
 
+def _praise_complaint_mismatch(normalized: str) -> bool:
+    """
+    Whether exclamation-grade praise shares a sentence with a
+    complaint -- the signature of sarcasm the construction patterns
+    cannot see, because the praise words outscore the complaint in
+    the lexicon and the message reads as satisfied praise.
+
+    A contrastive "but" cancels the mismatch: a mixed review is not
+    a mock cheer.
+    """
+
+    for sentence in re.split(r"[.!?]+", normalized):
+
+        if any(
+            re.search(marker, sentence)
+            for marker in SARCASM_CONTRAST_MARKERS
+        ):
+
+            continue
+
+        if not any(
+            re.search(marker, sentence)
+            for marker in SARCASM_PRAISE_MARKERS
+        ):
+
+            continue
+
+        if any(
+            re.search(context, sentence)
+            for context in SARCASM_COMPLAINT_CONTEXTS
+        ):
+
+            return True
+
+    return False
+
+
 def _sarcasm_score(
     text: str,
     language: str,
@@ -1154,7 +1298,18 @@ def _sarcasm_score(
 
     if matched_pattern is None:
 
-        return False, 0.0, None
+        # No known construction -- but praise and a complaint may
+        # still share a sentence ("Fantastic, you charged me
+        # twice."), with the praise outscoring the complaint so
+        # heavily that only this polarity mismatch reveals the
+        # sarcasm.
+        if not _praise_complaint_mismatch(normalized):
+
+            return False, 0.0, None
+
+        matched_pattern = "praise attached to a complaint"
+
+        pattern_weight = config.sarcasm_mismatch_weight
 
     # The construction's own weight, plus a bonus for real praise in
     # the same message. "Great, still not refunded" clears the
@@ -1299,6 +1454,53 @@ def _finalize(
     return best_label, round(confidence, 4), dict(scores)
 
 
+def _apply_llm_fallback(
+    text: str,
+    language: str,
+    config: SentimentConfig,
+    result: SentimentResult,
+) -> SentimentResult:
+    """
+    The optional second opinion.
+
+    Invoked only when a hook was injected AND the rule layer's own
+    confidence sits below the configured threshold. With the default
+    None hook this never runs, so the module stays deterministic and
+    offline; a hook that raises or returns nothing degrades to the
+    rule-based result rather than taking message classification down
+    with it.
+    """
+
+    hook = config.llm_fallback
+
+    if hook is None or result.confidence >= config.minimum_confidence:
+
+        return result
+
+    try:
+
+        second_opinion = hook(text, language, result)
+
+    except Exception:
+
+        return result
+
+    if not isinstance(second_opinion, SentimentResult):
+
+        return result
+
+    if not any(
+        "llm fallback" in item for item in second_opinion.evidence
+    ):
+
+        second_opinion.evidence.append(
+            "llm fallback: rule confidence below "
+            f"{config.minimum_confidence}"
+        )
+
+    return second_opinion
+
+
 def analyse_message(
     text: str,
     language: Optional[str] = None,
@@ -1310,6 +1512,12 @@ def analyse_message(
 
     ``now`` is accepted for interface consistency with the rest of the
     support-ops modules; classification itself is time-independent.
+
+    When ``config.llm_fallback`` is set and the rule layer's own
+    confidence falls below ``config.minimum_confidence``, that hook
+    is consulted for a second opinion (see ``_apply_llm_fallback``);
+    with the default None hook the classification is fully
+    deterministic and offline.
     """
 
     config = config or SentimentConfig()
@@ -1345,6 +1553,12 @@ def analyse_message(
         # A sarcastic complaint is negative in intent.
         polarity = -max(0.35, abs(polarity))
 
+        # The sarcasm evidence is real even when the praise words
+        # dominated the underlying score so heavily that the
+        # share-of-evidence confidence is low: a sarcastic reading
+        # is never reported at near-zero confidence.
+        confidence = round(max(confidence, sarcasm_score), 4)
+
         label_scores[SentimentLabel.SARCASTIC.value] = (
             label_scores.get(SentimentLabel.SARCASTIC.value, 0.0)
             + sarcasm_score
@@ -1361,7 +1575,7 @@ def analyse_message(
         scores.get(SentimentLabel.URGENT.value, 0.0) / 0.9,
     )
 
-    return SentimentResult(
+    result = SentimentResult(
         label=label,
         underlying_label=underlying,
         confidence=confidence,
@@ -1380,6 +1594,12 @@ def analyse_message(
         evidence=evidence,
         repeated_negative=False,
         message_count=1,
+    )
+
+    # The optional injected second opinion, only for low-confidence
+    # results; with the default None hook this is a no-op.
+    return _apply_llm_fallback(
+        text or "", language, config, result
     )
 
 

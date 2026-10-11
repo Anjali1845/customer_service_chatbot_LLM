@@ -28,8 +28,12 @@ DB_PATH = BASE_DIR / "faiss_index"
 # -----------------------------
 # Gemini LLM
 # -----------------------------
+# Read from the environment so the model id can change without a code
+# edit, rather than being hard-coded in more than one module.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
+    model=GEMINI_MODEL,
     google_api_key=os.getenv("GOOGLE_API_KEY"),
     temperature=0.2,
 )

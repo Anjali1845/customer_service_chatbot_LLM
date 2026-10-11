@@ -11,6 +11,9 @@ Requirements covered by this core module:
 - Maximum 10-message conversation context
 - Session isolation
 - Low-confidence language clarification
+- Unsupported-language clarification (French, German, etc. are
+  flagged explicitly, not guessed into a supported language)
+- Short follow-ups inherit the session's established language
 - Spelling / transliteration tolerance
 - Multiple request detection
 - Customer correction detection
@@ -27,6 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import re
+import unicodedata
 import uuid
 from typing import Dict, List, Optional, Tuple
 
@@ -145,6 +149,13 @@ LANGUAGE_KEYWORDS = {
         "tha",
         "thi",
         "karna",
+        # Romanised everyday words. "haan" in particular is the
+        # single-word "yes" a Hindi-speaking customer sends as a
+        # whole follow-up message.
+        "haan",
+        "haanji",
+        "theek",
+        "achha",
     },
 
     "telugu": {
@@ -164,6 +175,20 @@ LANGUAGE_KEYWORDS = {
         "undi",
         "unnadi",
         "dayachesi",
+        # Romanised everyday words, so that a message like
+        # "Naa order inka raaledu" is recognised as Telugu-heavy
+        # instead of coming out as an English/Telugu coin flip.
+        "avunu",
+        "sare",
+        "inka",
+        "raaledu",
+        "raavu",
+        "vachinda",
+        "vachindi",
+        "tarvata",
+        "ippudu",
+        "konchem",
+        "chala",
     },
 
     "spanish": {
@@ -189,6 +214,183 @@ LANGUAGE_KEYWORDS = {
         "gracias",
     },
 }
+
+
+# Languages the product deliberately does NOT support, but that a
+# customer may still write in. Words here are chosen to be
+# unambiguous for their language -- nothing in this table is also a
+# word in a supported language's keyword set -- because a single
+# borrowed foreign word must never flag a whole message.
+UNSUPPORTED_LANGUAGE_KEYWORDS = {
+
+    "french": {
+        "bonjour",
+        "salut",
+        "merci",
+        "oui",
+        "non",
+        "je",
+        "tu",
+        "il",
+        "elle",
+        "nous",
+        "vous",
+        "ils",
+        "suis",
+        "est",
+        "sont",
+        "pas",
+        "besoin",
+        "veux",
+        "veut",
+        "voudrais",
+        "mon",
+        "ma",
+        "mes",
+        "votre",
+        "commande",
+        "remboursement",
+        "rembourser",
+        "colis",
+        "livraison",
+        "livre",
+        "recu",
+        "probleme",
+        "aide",
+        "avec",
+        "pour",
+        "une",
+        "et",
+        "de",
+        "du",
+        "le",
+        "les",
+        "des",
+        "annule",
+        "jamais",
+        "toujours",
+        "encore",
+    },
+
+    "german": {
+        "bitte",
+        "danke",
+        "hallo",
+        "guten",
+        "nicht",
+        "mein",
+        "meine",
+        "bestellung",
+        "bestellt",
+        "brauche",
+        "hilfe",
+        "entschuldigung",
+        "ich",
+        "mich",
+        "mir",
+        "sie",
+        "und",
+        "fur",
+        "ist",
+        "habe",
+        "haben",
+        "sehr",
+        "warum",
+        "wann",
+        "wie",
+        "wo",
+        "noch",
+        "auch",
+        "aber",
+        "kaputt",
+        "defekt",
+        "ruckgabe",
+        "ruckzahlung",
+        "schicken",
+        "wunsche",
+        "ware",
+        "leid",
+    },
+
+    "italian": {
+        "buongiorno",
+        "grazie",
+        "ciao",
+        "ordine",
+        "rimborso",
+        "bisogno",
+        "aiuto",
+        "favore",
+        "sono",
+        "per",
+        "mia",
+        "mio",
+        "del",
+        "della",
+        "arrivato",
+        "pagamento",
+        "problema",
+        "vorrei",
+        "voglio",
+        "questo",
+        "questa",
+        "scusi",
+        "signore",
+        "signora",
+        "il",
+        "lo",
+        "non",
+        "ho",
+    },
+
+    "portuguese": {
+        "obrigado",
+        "obrigada",
+        "ola",
+        "chegou",
+        "meu",
+        "minha",
+        "meus",
+        "minhas",
+        "quero",
+        "preciso",
+        "ajuda",
+        "conta",
+        "cancelar",
+        "dinheiro",
+        "voltar",
+        "favor",
+        "atrasado",
+        "nao",
+    },
+}
+
+# Scripts no supported language is written in. One character of one
+# of these blocks is decisive evidence on its own.
+UNSUPPORTED_SCRIPT_RANGES = {
+    "chinese": (0x4E00, 0x9FFF),
+    "japanese": (0x3040, 0x30FF),
+    "korean": (0xAC00, 0xD7AF),
+    "arabic": (0x0600, 0x06FF),
+    "hebrew": (0x0590, 0x05FF),
+    "russian": (0x0400, 0x04FF),
+    "greek": (0x0370, 0x03FF),
+    "thai": (0x0E00, 0x0E7F),
+}
+
+# Values that may sit in a message's ``language`` field without
+# being a language the conversation can continue in.
+NON_LANGUAGE_VALUES = ("unknown", "", None, "unsupported")
+
+
+def _is_real_language(language) -> bool:
+    """
+    True when ``language`` names an actual language, rather than a
+    detection failure ("unknown") or an explicit unsupported-language
+    signal ("unsupported").
+    """
+
+    return language not in NON_LANGUAGE_VALUES
 
 
 def _normalize_text(text: str) -> str:
@@ -337,6 +539,107 @@ def _script_scores(text: str) -> Dict[str, int]:
     return scores
 
 
+def _fold_diacritics(token: str) -> str:
+    """
+    Reduce a token to its base letters: "reçu" -> "recu",
+    "für" -> "fur", "não" -> "nao".
+    """
+
+    decomposed = unicodedata.normalize(
+        "NFKD",
+        token,
+    )
+
+    return "".join(
+        char
+        for char in decomposed
+        if not unicodedata.combining(char)
+    )
+
+
+def _unsupported_language_scores(
+    text: str,
+    tokens: List[str],
+    normalized: str,
+) -> Dict[str, float]:
+    """
+    Score evidence that the message is in a language the product
+    does not support (French, German, and so on).
+
+    Only exact keyword matches count, and a language needs two
+    distinct hits before it counts at all -- fuzzy matching against a
+    language we cannot even answer in would guess far too often, and
+    one borrowed foreign word must never flag a whole message. Tokens
+    are folded to their base letters first, so both "reçu" and "recu"
+    match, whichever keyboard the customer typed on.
+    """
+
+    scores: Dict[str, float] = {}
+
+    def add(
+        language: str,
+        amount: float,
+    ) -> None:
+
+        scores[language] = (
+            scores.get(language, 0.0) + amount
+        )
+
+    folded = {
+        _fold_diacritics(token)
+        for token in tokens
+    }
+
+    for language, keywords in (
+        UNSUPPORTED_LANGUAGE_KEYWORDS.items()
+    ):
+
+        matched = folded & keywords
+
+        if len(matched) >= 2:
+
+            add(
+                language,
+                float(len(matched)),
+            )
+
+    # A script no supported language uses is decisive on its own;
+    # the cap keeps one long Chinese message from swamping the
+    # numbers without meaning anything more than one character does.
+    for language, (start, end) in (
+        UNSUPPORTED_SCRIPT_RANGES.items()
+    ):
+
+        count = sum(
+            1
+            for char in text
+            if start <= ord(char) <= end
+        )
+
+        if count:
+
+            add(
+                language,
+                min(count, 3) * 2.0,
+            )
+
+    # Diacritics that belong to French and never to a supported
+    # language. These can push a short accented message over the
+    # keyword threshold, but never reach it alone.
+    if re.search(
+        r"[èàùçêôâîûëï]",
+        normalized,
+    ):
+
+        add("french", 1.5)
+
+    if "é" in normalized:
+
+        add("french", 1.0)
+
+    return scores
+
+
 def detect_language(
     text: str,
     config: Optional[Task6Config] = None,
@@ -350,6 +653,15 @@ def detect_language(
         mixed
         detected_languages
         clarification_required
+        scores
+
+    When the message is confidently a language the product does not
+    support (French, German, and so on, or any script no supported
+    language is written in), the language is "unsupported" with
+    ``clarification_required`` True so the caller can ask, instead
+    of guessing the closest supported language. The result then also
+    carries ``unsupported`` (True) and ``unsupported_language`` (the
+    name of the detected language).
     """
 
     config = config or Task6Config()
@@ -420,13 +732,96 @@ def detect_language(
                     scores[language] += 0.6
                     break
 
-    # Spanish-specific characters.
-    if re.search(
-        r"[áéíóúñ¿¡]",
-        normalized,
+    # Spanish-specific characters. "é" is deliberately excluded: it is
+    # at least as common in French and Italian, and crediting it to
+    # Spanish is what made French support messages come out labelled
+    # "spanish" with enough confidence to be answered.
+    if (
+        "spanish" in scores
+        and re.search(
+            r"[áíóúñ¿¡]",
+            normalized,
+        )
     ):
 
         scores["spanish"] += 1.5
+
+    # Unsupported-language evidence. This must be decided before the
+    # low-confidence fallback: a French message with no English,
+    # Hindi, Telugu or Spanish words has zero supported evidence, and
+    # would otherwise fall through to "unknown" instead of the
+    # explicit unsupported signal the caller needs in order to
+    # clarify rather than guess.
+    unsupported_scores = _unsupported_language_scores(
+        text,
+        tokens,
+        normalized,
+    )
+
+    best_supported = (
+        max(scores.values())
+        if scores
+        else 0.0
+    )
+
+    best_unsupported_language = None
+    best_unsupported_score = 0.0
+
+    for language, score in unsupported_scores.items():
+
+        if score > best_unsupported_score:
+
+            best_unsupported_language = language
+            best_unsupported_score = score
+
+    # The unsupported evidence must be real (two distinct keyword
+    # hits, or one character of a script no supported language uses)
+    # and must outweigh the supported evidence, so a supported
+    # message is never flagged because it borrowed a foreign word.
+    if (
+        best_unsupported_score >= 2.0
+        and best_unsupported_score > best_supported
+    ):
+
+        total = (
+            sum(scores.values())
+            + sum(unsupported_scores.values())
+        )
+
+        confidence = (
+            best_unsupported_score / total
+            if total > 0
+            else 1.0
+        )
+
+        return {
+            "language": "unsupported",
+            "confidence": round(
+                confidence,
+                3,
+            ),
+            "mixed": False,
+            "detected_languages": [
+                best_unsupported_language
+            ],
+            "clarification_required": True,
+            "unsupported": True,
+            "unsupported_language": (
+                best_unsupported_language
+            ),
+            "reason": (
+                "Message appears to be "
+                f"{best_unsupported_language}, "
+                "which is not supported."
+            ),
+            "scores": {
+                language: round(
+                    score,
+                    3,
+                )
+                for language, score in scores.items()
+            },
+        }
 
     total = sum(scores.values())
 
@@ -529,6 +924,24 @@ ENTITY_PATTERNS = {
 }
 
 
+# An email address is never a person, and neither is a structured
+# code. Both are masked out of the text before any name pattern
+# runs, so the local part of an email ("anil" in "anil@x.com") can
+# never be captured as, or glued onto, a customer name, and the
+# fragment of a code can never be read as one.
+EMAIL_PATTERN = (
+    r"[A-Za-z0-9._%+\-]+@"
+    r"[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+)
+
+# All-caps letters-dash-digits codes: ORD-1234, PRD-ABC123, SKU-9912.
+# Case-sensitive on purpose -- "Anil-Rao" is a hyphenated surname,
+# not a product code, and must survive as a name.
+STRUCTURED_CODE_PATTERN = (
+    r"\b[A-Z]{1,6}[-_][A-Z0-9]{2,12}\b"
+)
+
+
 # Person names are capitalisation sensitive, so they cannot use
 # the case-insensitive ENTITY_PATTERNS above.
 NAME_PATTERNS = [
@@ -539,9 +952,18 @@ NAME_PATTERNS = [
     # "I am Priya Sharma", not "i am Priya Sharma" -- while the captured
     # name stays capitalisation-sensitive, which is the whole reason
     # this pattern cannot use the case-insensitive ENTITY_PATTERNS.
-    r"\b(?i:my name is|i am|i'm|this is|name is|"
+    # A bare "name" is a cue too, so the labelled forms a customer
+    # actually sends -- "Name Anil Rao", "name: Anil Rao",
+    # "Full name: Anil Rao" -- are recognised; the separator then
+    # tolerates the label's colon, comma or dash. The lookbehinds keep
+    # "product name Premium Mixer" and friends from being read as a
+    # customer: those label a thing, not a person.
+    r"(?<!product )(?<!item )(?<!brand )"
+    r"\b(?i:my name is|name is|customer name|full name|"
+    r"i am|i'm|this is|"
     r"mera naam|mera nam|mi nombre es|me llamo|"
-    r"naa peru|na peru)\s+"
+    r"naa peru|na peru|name)\b"
+    r"[\s:,\-]+"
     r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)",
 
     r"^(?:hi|hello|hey|namaste|hola|namaskaram)\s*,?\s+"
@@ -594,16 +1016,33 @@ def extract_person_names(text: str) -> List[str]:
     Extract customer names from common introduction patterns.
 
     Deliberately conservative: only names introduced by a
-    greeting, an introduction phrase or an honorific are
-    captured, so ordinary capitalised words are not mistaken
-    for people.
+    greeting, an introduction phrase, a label ("Name Anil Rao",
+    "name: Anil Rao") or an honorific are captured, so ordinary
+    capitalised words are not mistaken for people.
+
+    Email addresses and structured codes (order ids, product
+    codes) are masked out before any pattern runs: an email
+    address must never yield a person name, and neither must the
+    words around an identifier.
     """
 
     names: List[str] = []
 
+    masked = re.sub(
+        EMAIL_PATTERN,
+        " ",
+        text,
+    )
+
+    masked = re.sub(
+        STRUCTURED_CODE_PATTERN,
+        " ",
+        masked,
+    )
+
     for pattern in NAME_PATTERNS:
 
-        for match in re.findall(pattern, text):
+        for match in re.findall(pattern, masked):
 
             candidate = match.strip()
 
@@ -687,6 +1126,57 @@ def preserve_entities(
         "missing": missing,
         "preserved": not bool(missing),
     }
+
+
+def _is_identifier_only(text: str) -> bool:
+    """
+    True when the message carries an identifier or a number but no
+    language signal at all: "ORD-1234", "123456789", "PRD-ABC123".
+
+    Such a message is the natural answer to "what is your order
+    ID?" -- it is never a language problem, so asking which language
+    the customer prefers is always the wrong reply to it.
+    """
+
+    stripped = text.strip()
+
+    if not stripped:
+
+        return False
+
+    remainder = stripped
+    has_identifier = False
+
+    for patterns in ENTITY_PATTERNS.values():
+
+        for pattern in patterns:
+
+            remainder, replaced = re.subn(
+                pattern,
+                " ",
+                remainder,
+                flags=re.IGNORECASE,
+            )
+
+            if replaced:
+
+                has_identifier = True
+
+    if re.search(r"\d", stripped):
+
+        has_identifier = True
+
+    if not has_identifier:
+
+        return False
+
+    # Whatever survives the entity patterns must contain no letters
+    # in any script for the message to be identifier-only.
+    return not re.search(
+        r"[^\W\d_]",
+        remainder,
+        flags=re.UNICODE,
+    )
 
 
 # ============================================================
@@ -803,7 +1293,7 @@ class ConversationSession:
 
             language = message.language
 
-            if language in ("unknown", "", None):
+            if not _is_real_language(language):
                 continue
 
             if language not in seen:
@@ -823,7 +1313,7 @@ class ConversationSession:
 
             language = message.language
 
-            if language in ("unknown", "", None):
+            if not _is_real_language(language):
                 continue
 
             counts[language] = counts.get(language, 0) + 1
@@ -837,10 +1327,17 @@ class ConversationSession:
         )[0]
 
     def last_user_language(self) -> Optional[str]:
+        """
+        The language of the most recent user message that was
+        detected as a real language. Follow-ups too short to detect
+        anything from inherit this, which is what makes "yes",
+        "ORD-1234" or "Haan" continue the conversation instead of
+        tripping the low-confidence clarification.
+        """
 
         for message in reversed(self.user_messages()):
 
-            if message.language not in ("unknown", "", None):
+            if _is_real_language(message.language):
 
                 return message.language
 
@@ -1025,6 +1522,118 @@ class SessionManager:
             now,
         )
 
+    def _resolve_followup_language(
+        self,
+        session: ConversationSession,
+        content: str,
+        detection: Dict,
+    ) -> Dict:
+        """
+        Resolve a short or ambiguous follow-up against the language
+        the session already carries.
+
+        In a live conversation the replies "yes", "ok thanks",
+        "Haan" or a bare "ORD-1234" carry no language signal of their
+        own, but they are perfectly clear answers -- "ORD-1234" is
+        exactly what the assistant asked for when it requested the
+        order ID. Flagging them as unknown, and answering with the
+        "please rephrase or tell me your preferred language"
+        clarification, rejects the customer's answer to the
+        assistant's own question, so they continue the conversation
+        in the language already established by ``last_user_language``
+        and ``dominant_language``.
+
+        A message confidently in a language the product does not
+        support is never inherited past: the customer switched to
+        French, and that still needs to be clarified, not guessed.
+        """
+
+        if not detection.get("clarification_required"):
+
+            return detection
+
+        if (
+            detection.get("unsupported")
+            or detection.get("language") == "unsupported"
+        ):
+
+            return detection
+
+        identifier_only = _is_identifier_only(content)
+
+        tokens = _tokenize(content)
+
+        # A message with neither words nor identifiers -- empty, or
+        # bare punctuation -- has nothing to inherit from: it stays a
+        # clarification no matter what the session already holds.
+        if not tokens and not identifier_only:
+
+            return detection
+
+        # A long unrecognisable message keeps the clarification: only
+        # a short follow-up or a bare identifier is plausibly a clear
+        # answer that merely carries no language of its own.
+        if not identifier_only and len(tokens) > 4:
+
+            return detection
+
+        session_language = (
+            session.last_user_language()
+            or session.dominant_language()
+        )
+
+        if session_language:
+
+            resolved = dict(detection)
+
+            resolved.update(
+                {
+                    "language": session_language,
+                    "confidence": max(
+                        detection.get(
+                            "confidence",
+                            0.0,
+                        ),
+                        0.75,
+                    ),
+                    "clarification_required": False,
+                    "inherited_from_session": True,
+                    "identifier_only": identifier_only,
+                    "reason": (
+                        "Short or ambiguous follow-up; continuing "
+                        "in the session's established language."
+                    ),
+                }
+            )
+
+            return resolved
+
+        if identifier_only:
+
+            # No session language to inherit and no language signal
+            # in the message either: an identifier-only message is
+            # still a valid in-context reply, never a low-confidence
+            # one, so it is answered in the default language.
+            resolved = dict(detection)
+
+            resolved.update(
+                {
+                    "language": "english",
+                    "confidence": 0.75,
+                    "clarification_required": False,
+                    "inherited_from_session": False,
+                    "identifier_only": True,
+                    "reason": (
+                        "Identifier-only message with no session "
+                        "language; using the default language."
+                    ),
+                }
+            )
+
+            return resolved
+
+        return detection
+
     def add_user_message(
         self,
         session_id: str,
@@ -1045,6 +1654,15 @@ class SessionManager:
         detection = detect_language(
             content,
             self.config,
+        )
+
+        # The session's existing language state resolves short
+        # follow-ups and bare identifiers before anything is stored,
+        # so the stored message and the returned detection agree.
+        detection = self._resolve_followup_language(
+            session,
+            content,
+            detection,
         )
 
         entities = extract_preserved_entities(

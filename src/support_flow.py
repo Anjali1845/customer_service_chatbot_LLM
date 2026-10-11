@@ -66,7 +66,11 @@ from task8_ticketing import (
     Ticket,
     TicketPolicy,
     build_information_request,
+    complete_ticket,
     create_ticket,
+    find_related_tickets,
+    introduces_new_issue,
+    is_followup_without_issue,
     link_ticket,
     next_ticket_id,
     recalculate_deadlines,
@@ -469,7 +473,19 @@ class SupportFlow:
             result.message_id = message.message_id
 
         # 6. Ticket.
-        if self._should_raise_ticket(result, escalation):
+        #
+        # A reply that answers an outstanding information request must
+        # be processed even when nothing about it is negative: the
+        # customer supplying the missing name and order id is exactly
+        # the turn that has to reach the open ticket, and gating only
+        # on a negative sentiment is what let those replies spawn a
+        # second ticket while the first sat waiting forever.
+        awaiting_info = (
+            ticket_in_progress is not None
+            and ticket_in_progress.status == "awaiting_info"
+        )
+
+        if self._should_raise_ticket(result, escalation) or awaiting_info:
 
             tickets, decisions = self.handle_support_ticket(
                 session_id, question, sentiment, session, moment
@@ -656,18 +672,91 @@ class SupportFlow:
 
         summary = conversation_summary(session)
 
+        # A message that continues an open ticket is folded into it,
+        # not turned into a second ticket for the same problem. This
+        # is the missing-information loop: the reply that supplies the
+        # name, contact and order id completes the ticket it belongs
+        # to, instead of opening a new one that is missing the order
+        # id because it was never matched against the first.
+        #
+        # Two different things continue a ticket, and they are not the
+        # same thing: answering a question the ticket is still waiting
+        # on, and a message with no issue of its own at all ("still
+        # waiting, this is frustrating"). A restated *problem* is
+        # neither -- it stays on the duplicate path below, so a genuine
+        # re-report still lands on the review queue with its own rule.
+        open_ticket = self._find_open_ticket(session_id)
+
+        continue_open = False
+
+        if open_ticket is not None:
+
+            if open_ticket.status == "awaiting_info":
+
+                continue_open = not introduces_new_issue(
+                    message, open_ticket, policy
+                )
+
+            else:
+
+                continue_open = is_followup_without_issue(message)
+
+        if continue_open:
+
+            completed, _filled = complete_ticket(
+                open_ticket,
+                message,
+                sentiment,
+                policy=policy,
+                sla_policy=self.config.sla,
+                now=moment,
+                conversation_summary=summary,
+            )
+
+            decisions: List[RoutingDecision] = []
+
+            # Only route a ticket that never got an owner and is now
+            # actionable. One already on an agent's desk keeps it.
+            if completed.assigned_agent is None and not (
+                completed.missing_fields
+            ):
+
+                decisions = self._route([completed], moment)
+
+            if self.store is not None:
+
+                self.store.save_ticket(completed)
+
+                for decision in decisions:
+
+                    self.store.save_routing_decision(
+                        decision.to_dict()
+                    )
+
+            return [completed], decisions
+
         issues = split_issues(message)
 
         tickets: List[Ticket] = []
 
         taken = self.known_ticket_ids()
 
+        # Each issue is categorised from its own words. The
+        # conversation's risk topics would otherwise bleed across: the
+        # duplicate-charge risk raised by the first half of a message
+        # forced the second, unrelated half into the payment category,
+        # and a risk topic raised in an earlier turn did the same to a
+        # later problem in the same session.
         for issue in issues:
+
+            issue_sentiment = analyse_message(
+                issue, None, self.config.sentiment, moment
+            )
 
             ticket = create_ticket(
                 session_id,
                 issue,
-                sentiment,
+                issue_sentiment,
                 policy=policy,
                 sla_policy=self.config.sla,
                 now=moment,
@@ -679,20 +768,21 @@ class SupportFlow:
                 existing=existing,
             )
 
-            # A later part of a multi-issue message is the same
-            # conversation, so it is grouped with the primary even
-            # when the two issues are unrelated to each other.
+            # A later part of a multi-issue message is linked to the
+            # primary only when the two issues really are related. Two
+            # unrelated problems in one message are two problems, and
+            # linking them unconditionally is what sent a technical
+            # fault to the billing agent because an earlier payment
+            # ticket had gone there.
             if tickets and not ticket.duplicate_of:
 
-                link_ticket(
-                    ticket,
-                    {
-                        "ticket_id": tickets[0].ticket_id,
-                        "relation": "related",
-                        "score": 0.0,
-                        "reasons": ["same conversation"],
-                    },
+                related = find_related_tickets(
+                    ticket, [tickets[0]], policy
                 )
+
+                if related:
+
+                    link_ticket(ticket, related[0], tickets[0])
 
             taken.append(ticket.ticket_id)
 
@@ -756,7 +846,11 @@ class SupportFlow:
 
         for index, ticket in enumerate(tickets):
 
-            if index and tickets[0].assigned_agent:
+            if (
+                index
+                and ticket.group_id
+                and tickets[0].assigned_agent
+            ):
 
                 ticket.assigned_agent = tickets[0].assigned_agent
                 ticket.team = tickets[0].team
